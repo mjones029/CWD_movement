@@ -1,0 +1,242 @@
+---
+title: "Case-control pairing"
+author: "Marie Gilbertson"
+date: "2025-07-23"
+knit: (function(inputFile, encoding) {
+      out_dir <- "../Markdown_reports";
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_dir=file.path(dirname(inputFile), out_dir))})
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this report, I will demonstrate the simulation-based approach we used to pair chronic wasting disease (CWD) cases with controls. Pairing was based on matching day of the year, sex, and age as well as possible.  
+
+For data ownership reasons, the data is not publicly available. However, I will preview the data structure so others can adapt this approach for themselves. Readers interested in data access should contact Daniel Storm at the Wisconsin Department of Natural Resources.
+
+
+We'll start by loading the packages we'll need. I also always set my seed as standard practice (this makes randomization reproducible).
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+##### Clear Environment #####
+remove(list=ls())
+
+
+#### set seed ####
+set.seed(2711)
+
+
+#### load libraries ####
+library(adehabitatLT)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(amt)
+library(ggpubr)
+
+```
+
+
+
+## Load and preview data
+
+As stated in the introduction, the data itself is not publicly available, but I can give you a preview for replication purposes. We'll load in some data:
+```{r load-data}
+full.cases.controls <- read.csv("../Project_data/full_case_control_combinations.csv")
+nrow(full.cases.controls)
+head(full.cases.controls)
+print(paste(length(unique(full.cases.controls$lowtag)), "candidate controls"))
+print(paste(length(unique(full.cases.controls$cand.case)), "candidate cases"))
+```
+
+This particular dataset represents all possible case-control pairs. We see that we have 75 potential controls that can be paired with 45 end-stage CWD cases. The 45 cases combined with the 75 controls gives us a total of 3375 potential pairings (i.e., each case has 75 controls it could be paired with); this matches the number of rows in this dataset.  
+
+Looking at the first few lines of the dataset, let's go over what data is in each column:  
+
+1. lowtag: this is the ID number for the controls  
+
+2. cand.case: this is the ID number for the cases  
+
+3. case_days.coll.cov: this is the number of days with collar data for the given case. Some deer have very little GPS collar data prior to death; if possible, we'd like to prioritize pairing data-rich cases with data-rich controls so we minimize data loss due to poor temporal overlap. For example, say Case A has 12 days of data and Case B has 150 days. Both cases might be good matches with Controls C and D, but let's say Control C has 160 days of data and Control D only has 20 days. If we pair off Case A with Control C, and Case B with Control D, we would have a maximum of 12 days of paired data for pair A-C and 20 days of paired data for B-D. If we factor in the days of coverage, though, we could have a max of 12 days of paired data for pair A-D (no loss there), but a max of 150 days of paired data for pair B-C. All else being equal, accounting for data availability is important for minimizing data loss during the pairing process.  
+
+4. sex.match: True or False for if the sex of the case and control match. **When matching cases and controls, we want this value to be TRUE.**  
+
+5. interval.match: take the dates that encompass the six months prior to the given case's death, and the year-less range of dates with collar coverage for the control. How many days of overlap are there between these ranges? Note: this is "year-less" so data from March 2020 would be considered matching with data from March 2017. **When matching cases and controls, we want to maximize this value.**  
+
+6. closest.age.diff.at.case.death: a control might have movement data for several years, covering several different ages "within" that control individual. Let's say we have movement data from control C from the age of 2.5 to 4.5, and case A died in September at age 2.5. The "minimum difference in age at case death" for this pair could be as low as 0, if control C was also 2.5 in September. **When matching cases and controls, we want to minimize this value.**  
+
+
+
+
+
+
+## "Simulate" case-control matching
+
+A given case could be a good match with several different controls, and vice versa. At the same time, some pairings will be bad, and some might just be ok. In the latter case, perhaps a case and control match by sex and day, but are poor age matches. If each control can only be used once, there might be an ideal set of pairings the produces the most "good" matches and minimizes the number of "bad" matches. We can try to identify such a suite of pairs by running a pairing process in many different iterations, and selecting the iteration with the best complement of matches.  
+
+First, we can extract our set of cases and order them by the number of GPS collar days they have. We'll be making pairs one case at a time, so we'll try to pair off the cases with better collar coverage first in order to get matches with better overall coverage (the reason for this was described above).
+
+
+```{r case-order}
+case.ids <- full.cases.controls[,c("cand.case", "case_days.coll.cov")]
+case.ids <- case.ids[!duplicated(case.ids),]
+case.ids <- case.ids[order(case.ids$case_days.coll.cov, decreasing = T),]
+```
+
+
+Now we'll run a full case-control pairing process 500 times, storing the resulting pair-sets in a list at the end of each round. Because we're matching cases one at a time, we'll shuffle the order of cases at the start of each new round. 
+```{r run-sims}
+nsims <- 500
+match.trials <- vector(mode = "list", length = nsims)
+
+set.seed(3516)
+#### We'll repeat the case-control pairing process nsims (500) times, saving the results of each "simulation" ####
+for(z in 1:nsims){
+  # print(z)
+  ## shuffle order of case ids, but prioritize matching for those cases with a high degree of collar coverage ##
+  # extract "high" and "low" coverage cases
+  high.col <- case.ids[case.ids$case_days.coll.cov>180,]
+  low.col <- case.ids[case.ids$case_days.coll.cov<=180,]
+  
+  # shuffle order within these two groups
+  high.col <- high.col[sample(1:nrow(high.col), size = nrow(high.col), replace = F),]
+  low.col <- low.col[sample(1:nrow(low.col), size = nrow(low.col), replace = F),]
+  
+  # bind them back together
+  case.ids <- rbind(high.col, low.col)
+  
+  ## full set of 3,375 potential pairings
+  control.set <- full.cases.controls
+  
+  ## null out matches for a new simulation run
+  matches <- NULL
+  
+  #### Loop through cases, identifying a control match for each case ####
+  for(i in 1:nrow(case.ids)){
+    ## extract the set of controls currently available for a case
+    temp.case <- control.set[control.set$cand.case==case.ids$cand.case[i],]
+    
+    # only select from sex matches
+    temp.case <- temp.case[temp.case$sex.match,]
+    
+    # if no sex matches are available, skip to the next case
+    if(nrow(temp.case)==0) next
+    
+    # order available controls by interval matching and age differences
+    o <- with(temp.case, order(-interval.match, closest.age.diff.at.case.death))
+    temp.case <- temp.case[o,]
+    
+    selection <- NA
+    
+    # try to randomly select a match with full interval matching and <1 year age difference
+    poss.matches <- which(temp.case$interval.match==183 & temp.case$closest.age.diff.at.case.death<1)
+    if(length(poss.matches)>=1){
+      selection <- sample(poss.matches, size = 1)
+    }
+    
+    # if "ideal" match not available, try to randomly select a match with full interval matching and <5 year age difference
+    if(is.na(selection)){
+      poss.matches <- which(temp.case$interval.match==183 & temp.case$closest.age.diff.at.case.death<5)
+      if(length(poss.matches)>=1){
+        selection <- sample(poss.matches, size = 1)
+      }
+    }
+    
+    # if that match also fails, just take the top available match
+    if(is.na(selection)){
+      selection <- 1
+    }
+    
+    # extract data for the selected match
+    selected.match <- temp.case[selection,]
+    # remove that control from the pool of available controls
+    control.set <- control.set[control.set$lowtag != selected.match$lowtag,]
+    
+    # add this pair to the growing set of completed pairs
+    matches <- rbind(matches, selected.match)
+    
+  }
+  ## save back this full set of matches and start the next trial
+  match.trials[[z]] <- matches
+}
+```
+
+
+## Select best pair-set
+
+Let's take a peak at one of the 500 pair-sets:
+```{r preview-results}
+head(match.trials[[1]])
+```
+
+We can see how our top few pairs look like really nice matches. But let's look at all our different pair-sets and find the "best" one.  
+
+First, how many pairs do we get in each set?
+```{r num-matches}
+match.trial.eval <- data.frame(sim = seq(1, nsims),
+                               matches = unlist(lapply(match.trials, nrow))
+                              )
+summary(match.trial.eval$matches)
+
+## is the same case individual always "lost"?
+head(
+  lapply(match.trials, function(x){case.ids$cand.case[!case.ids$cand.case %in% x$cand.case]
+})
+)
+```
+
+It looks like we only ever get 44 pairs, even though we had 45 cases; no matter what we do, we can't get any more pairs than that - but we're also not losing matches in some pair-sets, so that's good. It also looks like it's not always the same case being lost, so we just don't have a perfect complement of controls for our cases.  
+
+Next, let's calculate some metrics to use for measuring the "quality" of our 500 pair sets. Within each set, we'll look at the median "interval match", the number of "interval matches" that are less than 120 days, the median "closest age difference at case death", and the number of age matches that are greater than 5 years.
+
+```{r match-metrics}
+match.trial.eval$med.interval <- unlist(lapply(match.trials, function(x) median(x$interval.match)))
+match.trial.eval$int.under.120 <- unlist(lapply(match.trials, function(x) nrow(subset(x, x$interval.match<120))))
+match.trial.eval$med.age.diff <- unlist(lapply(match.trials, function(x) median(x$closest.age.diff.at.case.death, na.rm = T)))
+match.trial.eval$age.diff.over.5 <- unlist(lapply(match.trials, function(x) nrow(subset(x, x$closest.age.diff.at.case.death>5))))
+
+head(match.trial.eval)
+```
+
+It looks like we've got some variability, so let's order our pair-sets to find the "best" one. We'll rank our pair-sets so they maximize number of matches, maximize interval matching, and minimize age differences (in that order).
+
+```{r order-matches}
+# order by interval matching and age differences
+o <- with(match.trial.eval, order(-matches, int.under.120, -med.interval, med.age.diff, age.diff.over.5))
+match.trial.eval_sorted <- match.trial.eval[o,]
+# check out the metrics for our "best" and "worst" pair-sets
+match.trial.eval_sorted[c(1, nrow(match.trial.eval_sorted)),]
+```
+
+By looking at our "best" and "worst" pair sets, we can see how our top set really does limit poor interval and age matches.  
+
+Now, we can extract all the case-control pairs from our "top" set and save it for use in the analysis of movement data.
+
+```{r}
+top.match <- match.trials[[match.trial.eval_sorted$sim[1]]]
+
+
+hist(top.match$closest.age.diff.at.case.death, main = "Histogram of age differences within pairs", xlab = "Age difference (years)")
+hist(top.match$interval.match, main = "Histogram of observation overlap within pairs", xlab = "Temporal overlap (days)")
+
+## save!
+# write.csv(top.match, "Output/matched_cases_and_controls.csv", row.names = F)
+
+```
+
+
+
+
+We'll close with this report's session info:
+
+```{r session-info}
+sessionInfo()
+```
+
