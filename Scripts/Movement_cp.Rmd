@@ -1,0 +1,504 @@
+---
+title: "Movement changepoints"
+author: "Marie Gilbertson"
+date: "2025-07-24"
+knit: (function(inputFile, encoding) {
+      out_dir <- "../Markdown_reports";
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_dir=file.path(dirname(inputFile), out_dir))})
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Introduction
+
+In this report, I demo the process we used to test for change points in white-tailed deer movement metrics. The approach used here is based on methods in [Barrile et al. 2024](https://doi.org/10.1002/ece3.11418).  
+
+For data ownership reasons, the data is not publicly available. However, I will preview the data structure so others can adapt this approach for themselves. Readers interested in data access should contact Daniel Storm at the Wisconsin Department of Natural Resources.
+
+
+We'll start by loading the packages we'll need. I also always set my seed as standard practice (this makes randomization reproducible).
+
+```{r load-libraries, results='hide', message=FALSE, warning=FALSE}
+
+##### Clear Environment #####
+remove(list=ls())
+
+
+#### set seed ####
+set.seed(48965)
+
+
+#### load libraries ####
+library(adehabitatLT)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(amt)
+library(ggpubr)
+library(tidyr)
+library(mcp)
+
+```
+
+
+
+## Bayesian changepoint analysis
+
+The actual changepoint model fitting is fairly slow and resource intensive, so I did this using high throughput resources at the University of Wisconsin-Madison Center for High Throughput Computing. For completeness, I've included the R script used in this high throughput environment here, but I will just read in the output from these runs below.
+
+```{r HT-mcp, eval=FALSE}
+#!/usr/bin/env Rscript
+## HT_movement_cp.R
+
+### Clear Environment ###
+remove(list=ls())
+
+#### load libraries ####
+library(adehabitatLT)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(amt)
+library(tidyr)
+library(mcp)
+
+
+#### load custom functions ####
+matching.days <- function(temp){
+  counts <- ddply(temp, .(day), nrow)
+  counts <- counts[counts$V1==2,]
+  temp <- temp[temp$day %in% counts$day,]
+  return(temp)
+}
+
+## slight variation on function used in conditional logistic regression; specific to changepoint data prep
+matching.days_timenumeric <- function(temp){
+  counts <- ddply(temp, .(time_numeric), nrow)
+  counts <- counts[counts$V1==2,]
+  temp <- temp[temp$time_numeric %in% counts$time_numeric,]
+  return(temp)
+}
+
+matching.wks <- function(temp){
+  counts <- ddply(temp, .(wpd), nrow)
+  counts <- counts[counts$V1==2,]
+  temp <- temp[temp$wpd %in% counts$wpd,]
+  return(temp)
+}
+
+outlier.cutoff <- function(x){
+  out.cutoff <- mean(x, na.rm = T) + (3*sd(x, na.rm = T))
+  return(out.cutoff)
+}
+
+#### set index ####
+## for running in parallel via high throughput
+z <- as.numeric(commandArgs(TRUE[1])) + 1
+
+
+#### set seed ####
+set.seed(48965 + z)
+
+
+#### MCMC run parameters ####
+adapt.n <- 22000
+iter.n <- 10000
+
+#### LOAD DATA ####
+## load movement metrics
+dat <- get(load("case_control_movement_metrics.Rdata")) 
+daily.dat <- dat$daily.metrics ## daily movement metrics
+wkly.od.areas <- dat$wkly.od.areas ## weekly range areas
+
+wkly.od.areas$start.date <- as.Date(wkly.od.areas$start.date, tz = "Canada/Saskatchewan") ## ignore Daylight Saving Time
+wkly.od.areas$end.date <- as.Date(wkly.od.areas$end.date, tz = "Canada/Saskatchewan")
+
+## load metadata
+data <- get(load("case_control_collar_and_metadata.Rdata"))
+## case-control metadata
+meta <- data$meta.data
+
+rm(data)
+
+
+#### prep model data ####
+## only days with at least two observations
+model.dat <- daily.dat[daily.dat$daily.obs>=2,]
+
+model.dat$day <- as.Date(model.dat$day, tz = "Canada/Saskatchewan")
+
+
+#### process dataset for each metric ####
+### loop through metrics
+metrics <- c("mean.km_p_hr", "daily.tort", "mean.disp_m")
+
+
+cutoffs <- apply(model.dat[,c("mean.km_p_hr", "daily.tort", "mean.disp_m")], 2, outlier.cutoff)
+model.dat.pre <- model.dat
+for(i in 1:length(metrics)){
+  
+  temp.met.dat <- model.dat[,colnames(model.dat)==metrics[i]]
+  temp.cutoff <- cutoffs[names(cutoffs)==metrics[i]]
+  in.index <- which(temp.met.dat<temp.cutoff | is.na(temp.met.dat))
+  model.dat <- model.dat[in.index,]
+}
+
+
+## only days where case and control both have data
+pairs <- model.dat %>% nest(data = c(-"pair.id")) 
+
+
+pairs <- pairs %>%
+  mutate(matched.days = lapply(data, matching.days))
+
+
+model.dat.paired <- pairs %>%
+  amt::select(pair.id, matched.days) %>% unnest(cols = matched.days)
+
+
+
+#### WEEKLY DATA ####
+## exclude outliers ##
+od.cutoff <- outlier.cutoff(wkly.od.areas$wkly.area.km2)
+# od.cutoff
+wkly.od.areas <- subset(wkly.od.areas, wkly.od.areas$wkly.area.km2<od.cutoff)
+
+
+## only weeks where case and control both have data ##
+wkpairs <- wkly.od.areas %>% nest(data = c(-"pair.id")) 
+
+
+wkpairs <- wkpairs %>%
+  mutate(matched.wks = lapply(data, matching.wks))
+
+model.dat.wkpaired <- wkpairs %>%
+  amt::select(pair.id, matched.wks) %>% unnest(cols = matched.wks)
+
+
+
+## table of high-throughput runs
+runs <- expand.grid(covars=c(metrics, "wkly.area.km2"),
+                    mods = 0:1,
+                    class = c("case", "control"),
+                    prior = c(FALSE, TRUE)
+)
+runs <- runs[!(runs$mods==0 & runs$prior),]
+
+
+
+## which covariate in this run? Transform response variable and set priors
+if(runs$covars[z]=="mean.km_p_hr"){
+  df_cov <- model.dat.paired[,c("id", "pair.id", "class", "mpd", "day", "mean.km_p_hr")]
+  df_cov$resp <- sqrt(df_cov$mean.km_p_hr)
+  prior <- list(cp_1 = "dnorm(120, 15) T(MINX, MAXX)")
+}else if(runs$covars[z]=="daily.tort"){
+  df_cov <- model.dat.paired[,c("id", "pair.id", "class", "mpd", "day", "daily.tort")]
+  df_cov$daily.tort_sc <- scale(df_cov$daily.tort)[,1]
+  constant <- abs(min(df_cov$daily.tort_sc)) + 0.01
+  df_cov$resp <- log(df_cov$daily.tort_sc+constant)
+  prior <- list(cp_1 = "dnorm(120, 15) T(MINX, MAXX)")
+}else if(runs$covars[z]=="mean.disp_m"){
+  df_cov <- model.dat.paired[,c("id", "pair.id", "class", "mpd", "day", "mean.disp_m")]
+  df_cov$resp <- log(df_cov$mean.disp_m)
+  prior <- list(cp_1 = "dnorm(120, 15) T(MINX, MAXX)")
+}else if(runs$covars[z]=="wkly.area.km2"){
+  df_cov <- model.dat.wkpaired[,c("id", "pair.id", "class", "wpd", "start.date", "wkly.area.km2")]
+  df_cov$resp <- log10(df_cov$wkly.area.km2)
+  colnames(df_cov)[colnames(df_cov)=="start.date"] <- "day"
+  prior <- list(cp_1 = "dnorm(4, 2) T(MINX, MAXX)")
+}
+
+
+
+
+# order data by id and date
+df_cov <- df_cov %>% arrange(id, day)
+
+
+# make sure id is a factor
+df_cov$id <- as.factor(as.character(df_cov$id))
+df_cov$id <- factor(df_cov$id)
+
+
+if(runs$covars[z] != "wkly.area.km2"){
+  ## add days pre-death for daily datasets
+  ids <- unique(df_cov$id)
+  df.new <- NULL
+  for(j in 1:length(ids)){
+    td <- df_cov[df_cov$id==ids[j],]
+    class <- unique(td$class)
+    
+    ## add "time pre-death" to tvRSF results
+    if(class=="case"){
+      tm <- meta[meta$cand.case==ids[j],]
+    }else{
+      tm <- meta[meta$lowtag==ids[j],]
+    }
+    
+    end.date <- as.Date(tm$case_mort.date, tz = "Canada/Saskatchewan")
+    
+    year <- format(max(td$day, na.rm = T), "%Y")
+    end.day <- format(end.date, "%m-%d")
+    if(end.day=="02-29"){
+      end.day <- "02-28"
+    }
+    end.date <- as.Date(paste0(year, "-", end.day), tz = "Canada/Saskatchewan")
+    
+    if(end.date<max(td$day)){
+      end.date <- as.Date(paste0(as.numeric(year)+1, "-", end.day), tz = "Canada/Saskatchewan")
+    }
+    
+    td$time_pre_death_days <- as.numeric(difftime(end.date, td$day, units = "days"))
+    td$time_numeric <- 180-td$time_pre_death_days # "reverse" of "days pre-death" so 180 = death day
+    
+    if(any(na.omit(abs(td$time_pre_death_days))>190) | any(na.omit(td$time_pre_death_days)<(-1))){
+      stop("Days pre-death is wrong somewhere!")
+    }
+    
+    df.new <- rbind(df.new, td)
+  }
+  
+}else{
+  df.new <- df_cov
+  # "reverse" of "weeks pre-death" so 26 = death week
+  df.new$time_numeric <- 26-df.new$wpd
+  
+}
+
+df_cov <- df.new
+
+
+## case or control?
+df_mod <- df_cov[df_cov$class==runs$class[z],]
+
+
+
+
+# order dataframe
+dfg <- df_mod %>% arrange(id, time_numeric)
+
+
+
+# conduct mcp analysis 
+dfs <- dfg %>% 
+  dplyr::select(id, resp, time_numeric) %>% 
+  dplyr::rename(x=time_numeric, y= resp) %>% 
+  as.data.frame()
+# test the two hypotheses (null/no change vs gradual change)
+
+if(!runs$prior[z]){
+  ## don't set prior ##
+  if(runs$mods[z]==0){
+    # no behavioral change
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0  # joined intercept, varying by id
+    )
+    fitm = mcp(modelf, data = dfs, par_x = "x", adapt = adapt.n, iter = iter.n)
+  }else if(runs$mods[z]==1){
+    # plateau then slope (gradual change in behavior as death approaches)
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0 + x  # joined slope, varying by id
+    )
+    fitm = mcp(modelf, data = dfs, adapt = adapt.n, iter = iter.n)
+  }
+  
+}else{
+  ## set prior values ##
+  if(runs$mods[z]==0){
+    # no behavioral change
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0  # joined intercept, varying by id
+    )
+    fitm = mcp(modelf, data = dfs, par_x = "x", prior = prior, adapt = adapt.n, iter = iter.n)
+  }else if(runs$mods[z]==1){
+    # plateau then slope (gradual change in behavior as death approaches)
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0 + x  # joined slope, varying by id
+    )
+    fitm = mcp(modelf, data = dfs, prior = prior, adapt = adapt.n, iter = iter.n)
+  }
+}
+
+
+# extract loo to see which model is preferred
+fitm$loo = loo(fitm)
+
+## save results to assess on local machine
+out.name <- paste0("move_mcp_mod", runs$mods[z], "_", runs$covars[z], "_", runs$class[z], "_prior", runs$prior[z], ".Rdata")
+save(fitm, file = out.name)
+
+
+
+```
+
+
+
+## View changepoint results
+
+Now we can load the changepoint models, which were fit using high throughput computing resources. I evaluated the changepoint models the same way for all movement metrics; for simplicity, I'll just show this process for movement rate. We start by reading in the changepoint models for cases and controls - these include a null model, an alternative hypothesis model with uninformative priors, and an alternative model with informative priors. We then use LOO to compare the three models for each of cases and controls. 
+
+```{r cp-rate}
+
+fit1_case <- get(load("../Project_data/move_mcp_mods/move_mcp_mod0_mean.km_p_hr_case_priorFALSE.Rdata"))
+fit2_case <- get(load("../Project_data/move_mcp_mods/move_mcp_mod1_mean.km_p_hr_case_priorFALSE.Rdata"))
+fit3_case <- get(load("../Project_data/move_mcp_mods/move_mcp_mod1_mean.km_p_hr_case_priorTRUE.Rdata"))
+
+fit1_control <- get(load("../Project_data/move_mcp_mods/move_mcp_mod0_mean.km_p_hr_control_priorFALSE.Rdata"))
+fit2_control <- get(load("../Project_data/move_mcp_mods/move_mcp_mod1_mean.km_p_hr_control_priorFALSE.Rdata"))
+fit3_control <- get(load("../Project_data/move_mcp_mods/move_mcp_mod1_mean.km_p_hr_control_priorTRUE.Rdata"))
+
+loo::loo_compare(fit1_case$loo, fit2_case$loo, fit3_case$lo) 
+loo::loo_compare(fit1_control$loo, fit2_control$loo, fit3_control$loo) 
+```
+For both cases and controls, model 2 (gradual change with uninformative priors) is the preferred model.  
+
+Let's look at posteriors for the cases and check our Rhats and other diagnostics. We'll start with the cases:
+```{r check-rate-cases}
+### cases ###
+fit1_case$loo
+fit2_case$loo
+fit3_case$loo
+
+
+# examine posterior fit of top model
+plot(fit1_case, q_fit = TRUE)
+plot(fit2_case, q_fit = TRUE)
+plot(fit3_case, q_fit = TRUE)
+
+
+#Gelman-Rubin convergence diagnostic (check Rhats)
+summary(fit1_case)
+summary(fit2_case)
+summary(fit3_case)
+
+# posterior check
+pp_check(fit1_case)
+pp_check(fit2_case)
+pp_check(fit3_case)
+
+# change point posteriors
+plot_pars(fit1_case)
+plot_pars(fit2_case)
+plot_pars(fit3_case)
+
+```
+
+And then we'll repeat the same process for controls...
+```{r check-rate-controls}
+### controls ###
+fit1_control$loo
+fit2_control$loo
+fit3_control$loo
+
+# examine posterior fit of top model
+plot(fit1_control, q_fit = TRUE)
+plot(fit2_control, q_fit = TRUE)
+plot(fit3_control, q_fit = TRUE)
+
+
+#Gelman-Rubin convergence diagnostic (check Rhats)
+summary(fit1_control) 
+summary(fit2_control)
+summary(fit3_control)
+
+
+# posterior check
+pp_check(fit1_control)
+pp_check(fit2_control)
+pp_check(fit3_control)
+
+
+# change point posteriors
+plot_pars(fit1_control)
+plot_pars(fit2_control)
+plot_pars(fit3_control)
+
+```
+
+We can then save our top models (model 2 for both cases and controls), and proceed with making some plots of our results. 
+```{r top-rate-mods}
+# save models as objects for later plotting
+rate_case <- fit2_case
+rate_control <- fit2_control
+```
+
+
+
+
+## Plotting results
+
+Now we can make a plot of our movement rate changepoint results:
+
+```{r rate-plot, warning=FALSE, message=FALSE}
+
+rate.a <- plot(rate_case, geom_data = FALSE, q_fit = TRUE, nsamples = 2000)+
+  geom_hline(yintercept = 0, color = "gray", linetype = "dashed") +
+  coord_cartesian(ylim = c(0.12, 0.26), expand = TRUE)+
+  scale_y_continuous(limits = c(0.12, 0.26), breaks = seq(0.15, 0.26, 0.05), labels = seq(0.15, 0.26, 0.05)) +
+  scale_x_continuous(breaks=c(0,30,60,90,120,150,181), limits=c(0,183), labels = c(6,5,4,3,2,1,"Death"))+
+  xlab("Months prior to case death") +
+  ylab("Transformed movement rate") +
+  theme_bw() +
+  theme(
+    panel.background = element_rect(colour = "black", linewidth=1, linetype = "solid"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.length = unit(0.2,"cm"),
+    axis.title.y = element_text(size = 16, color = "black"),
+    axis.title.x = element_text(size = 16, color = "black"),
+    axis.text.x = element_text(size = 12, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black")) +
+  theme(axis.title.x = element_text(margin = ggplot2::margin(t = 10)))+
+  theme(axis.title.y = element_text(margin = ggplot2::margin(r = 5)))+
+  theme(legend.position = "none")+
+  theme(legend.title = element_blank()) +
+  ggplot2::annotate("text", x = 90, y = 0.25, label = "CWD cases", size = 5, color = "black")
+
+rate.b <- plot(rate_control, geom_data = FALSE, q_fit = TRUE, nsamples = 2000)+
+  geom_hline(yintercept = 0, color = "gray", linetype = "dashed") +
+  coord_cartesian(ylim = c(0.12, 0.26), expand = TRUE)+
+  scale_y_continuous(limits = c(0.12, 0.26), breaks = seq(0.15, 0.26, 0.05), labels = seq(0.15, 0.26, 0.05)) +
+  scale_x_continuous(breaks=c(0,30,60,90,120,150,181), limits=c(0,183), labels = c(6,5,4,3,2,1,"Death"))+
+  xlab("Months prior to case death") +
+  ylab("Transformed movement rate") +
+  theme_bw() +
+  theme(
+    panel.background = element_rect(colour = "black", linewidth=1, linetype = "solid"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.length = unit(0.2,"cm"),
+    axis.title.y = element_blank(),
+    axis.title.x = element_text(size = 16, color = "black"),
+    axis.text.x = element_text(size = 12, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black")) +
+  theme(axis.title.x = element_text(margin = ggplot2::margin(t = 10)))+
+  theme(legend.position = "none")+
+  theme(legend.title = element_blank()) +
+  ggplot2::annotate("text", x = 90, y = 0.25, label = "Controls", size = 5, color = "black")
+
+
+rate.plot <- ggarrange(rate.a, rate.b, labels = c("A", "B"), nrow = 1)
+rate.plot
+
+## can save as a jpeg
+# ggsave("../Figures/movemcp_plots/rates.jpg", rate.plot, width = 12, height = 5, units = "in", dpi = 300)
+
+```
+
+
+And that's it! I'll close with my session info:
+```{r session-info}
+sessionInfo()
+```
