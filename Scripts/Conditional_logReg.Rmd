@@ -1,0 +1,303 @@
+---
+title: "Conditional logistic regressions"
+author: "Marie Gilbertson"
+date: "2025-07-23"
+knit: (function(inputFile, encoding) {
+      out_dir <- "../Markdown_reports";
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_dir=file.path(dirname(inputFile), out_dir))})
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this report, I demo the process we used to fit conditional logistic regressions to test for associations between white-tailed deer movement metrics and CWD case/control status.  
+
+For data ownership reasons, the data is not publicly available. However, I will preview the data structure so others can adapt this approach for themselves. Readers interested in data access should contact Daniel Storm at the Wisconsin Department of Natural Resources.
+
+
+We'll start by loading the packages we'll need. I also always set my seed as standard practice (this makes randomization reproducible).
+
+
+```{r load-libraries, results='hide', message=FALSE, warning=FALSE}
+##### Clear Environment #####
+remove(list=ls())
+
+
+#### set seed ####
+set.seed(2711)
+
+
+#### load libraries ####
+library(adehabitatLT)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(amt)
+library(ggpubr)
+library(survival)
+library(TwoStepCLogit)
+library(GGally)
+```
+
+
+Next we'll load some custom functions that come in handy later on.
+
+```{r load-functions}
+#### load cust functions ####
+
+## function for determining which days match within a case-control pair
+matching.days <- function(temp){
+  counts <- ddply(temp, .(day), nrow)
+  counts <- counts[counts$V1==2,]
+  temp <- temp[temp$day %in% counts$day,]
+  return(temp)
+}
+
+## function for determining which weeks match within a case-control pair
+matching.wks <- function(temp){
+  counts <- ddply(temp, .(wpd), nrow)
+  counts <- counts[counts$V1==2,]
+  temp <- temp[temp$wpd %in% counts$wpd,]
+  return(temp)
+}
+
+## function for identifying limit for outliers (based on 3 standard deviations beyond the mean)
+outlier.cutoff <- function(x){
+  out.cutoff <- mean(x, na.rm = T) + (3*sd(x, na.rm = T))
+  return(out.cutoff)
+}
+
+```
+
+
+## Load data
+
+Let's load the data and look at some previews so you can see how the data is structured. Again, these data are not publicly available, but by seeing the data structure, you should be able to follow the subsequent steps in the process. 
+
+```{r load-data}
+
+#### LOAD DATA ####
+## this is a list object containing two datasets: one with daily movement metrics, and one with weekly range areas. We'll use the daily data from here forward.
+dat <- get(load("../Project_data/case_control_movement_metrics.Rdata"))
+daily.dat <- dat$daily.metrics
+
+str(daily.dat)
+```
+
+Each row represents movement metrics for one day for one deer.  
+
+The columns are as follows:  
+1. pair.id = the ID number for each case-control pair  
+2. id = the ID number for each individual deer  
+3. class = case or control for each individual deer  
+4. mpd = months pre-case death (options are 1-6)  
+5. day = day of the year; the year is arbitrary to allow matching to the day of the year within pairs  
+6. daily.obs = number of GPS locations on a given day for a given deer  
+7. mean.km_p_hr = mean movement rate on a given day for a given deer (in km/hr)  
+8. mean.m_p_sex = mean movement rate on a given day for a given deer (in m/sec)  
+9. var.speed.kmph = variance of movement rates within a given day for a given deer (movement rates were in km/hr)  
+10. dist.m = summed distance traveled on a given day for a given deer (in meters)  
+11. daily.tort = tortuosity of movement on a given day for a given deer  
+12. mean.disp_m = mean displacement from range center on a given day for a given deer (in meters)  
+
+
+```{r summarize-numbers}
+paste(nrow(daily.dat), "oberservations from", length(unique(daily.dat$pair.id)), "pairs")
+```
+
+Before any data processing, we have over 10,000 days of observations from our 41 pairs of deer.
+
+## Prep data for modeling
+
+We'll focus on the daily data for demonstrating methods; the approach with weekly range area data was identical. With the daily dataset, we'll include only the days with at least two observations, as metrics like "mean movement rate" for a day with one observation aren't very representative. We also need more than one observation in a day to get metrics like daily movement rate variance. 
+
+```{r two-obs}
+## only days with at least two observations
+model.dat <- daily.dat[daily.dat$daily.obs>=2,]
+paste("Now:", nrow(model.dat), "oberservations from", length(unique(model.dat$pair.id)), "pairs")
+```
+
+It looks like we have quite a number of days with only one observation - this would result from some very coarse fix rates for some deer.  
+
+
+Next, we'll add a "response variable" column with just 0/1 for control/case. Lastly, we'll order the data by pair, day, and case/control status, which mimics the layout of data in an integrated step-selection function (I just find it easier to think about this way).
+```{r add-cc}
+## add case/control status and reorder
+model.dat$case <- ifelse(model.dat$class=="case", TRUE, FALSE)
+model.dat$day <- as.Date(model.dat$day, tz = "Canada/Saskatchewan")
+model.dat <- model.dat[order(model.dat$pair.id, model.dat$day, model.dat$case),]
+model.dat$resp <- ifelse(model.dat$case, 1, 0)
+```
+
+Next, we'll go ahead and exclude extreme outlier observations for each movement metric. Even if these are true observations, I want to make sure any differences I detect between cases and controls aren't really just due to a handful of outlier observations.
+```{r remove-outliers}
+### loop through metrics
+metrics <- c("mean.km_p_hr", "var.speed.kmph", "dist.m", "daily.tort", "mean.disp_m")
+
+### calculate the outlier limit or "cutoff" for each metric
+cutoffs <- apply(model.dat[,c("mean.km_p_hr", "var.speed.kmph", "dist.m", "daily.tort", "mean.disp_m")], 2, outlier.cutoff)
+model.dat.pre <- model.dat
+
+### exclude outlier observations
+for(i in 1:length(metrics)){
+  temp.met.dat <- model.dat[,colnames(model.dat)==metrics[i]]
+  temp.cutoff <- cutoffs[names(cutoffs)==metrics[i]]
+  in.index <- which(temp.met.dat<temp.cutoff | is.na(temp.met.dat))
+  model.dat <- model.dat[in.index,]
+}
+paste("Now:", nrow(model.dat), "oberservations from", length(unique(model.dat$pair.id)), "pairs")
+```
+
+Not too much data loss here: after excluding outliers, we now have over 7,000 observations, from our 41 case/control pairs.  
+
+
+Next, for each pair, we'll only include the days in which both members of that pair have an observation. In a somewhat inefficient workflow, I convert in and out of nested tibbles for this step. 
+```{r paired-days}
+## only days where case and control both have data
+pairs <- model.dat %>% nest(data = c(-"pair.id")) 
+
+pairs <- pairs %>%
+  mutate(matched.days = lapply(data, matching.days))
+
+model.dat.paired <- pairs %>%
+  amt::select(pair.id, matched.days) %>% unnest(cols = matched.days)
+
+head(model.dat.paired)
+paste("Now:", nrow(model.dat.paired), "oberservations from", length(unique(model.dat.paired$pair.id)), "pairs")
+
+```
+This step gives us quite a bit of data loss, as we end up with ~5,000 observations from 40 case/control pairs.  
+
+
+Next we'll scale and center all movement metrics for use as predictors in models. The "mean displacement from range center" ("mean.disp.m") metric is heavily skewed, so I also toss in a version with a log-transformation to try to assist with model fitting. Then, we plot all predictors and view pairwise correlations.
+```{r scale-center, message=FALSE}
+### scale and center
+model.dat.paired$mean.km_p_hr_sc <- scale(model.dat.paired$mean.km_p_hr)[,1]
+model.dat.paired$var.speed.kmph_sc <- scale(model.dat.paired$var.speed.kmph)[,1]
+model.dat.paired$dist.m_sc <- scale(model.dat.paired$dist.m)[,1]
+model.dat.paired$daily.tort_sc <- scale(model.dat.paired$daily.tort)[,1]
+model.dat.paired$mean.disp_m_sc <- scale(model.dat.paired$mean.disp_m)[,1]
+model.dat.paired$mean.disp_m_log <- log(model.dat.paired$mean.disp_m)
+model.dat.paired$mean.disp_m_log_sc <- scale(model.dat.paired$mean.disp_m_log)[,1]
+
+#### test for correlations ####
+ggpairs(model.dat.paired[,colnames(model.dat.paired) %in% c(metrics,  "mean.disp_m_log")])
+```
+
+
+We can see that we have correlations (at least at the rho > 0.6 level) for movement rate and rate variance; and movement rate and distance traveled.
+
+
+## Univariate modeling
+
+To avoid multicollinearity in our full models, we can fit univariate models and use AIC to pick which predictor will be used in full models.
+
+```{r univariate, warning=FALSE, error=TRUE}
+
+#### fit univariate models ####
+uni.mean.speed <- clogit(formula = resp ~ mean.km_p_hr_sc + strata(day) + cluster(pair.id), data = model.dat.paired,
+                         model=TRUE,x=TRUE, y=TRUE,method = "efron")
+
+uni.var.speed <- clogit(formula = resp ~ var.speed.kmph_sc + strata(day) + cluster(pair.id), data = model.dat.paired,
+                        model=TRUE,x=TRUE, y=TRUE,method = "efron")
+
+uni.dist.m <- clogit(formula = resp ~ dist.m_sc + strata(day) + cluster(pair.id), data = model.dat.paired,
+                     model=TRUE,x=TRUE, y=TRUE,method = "efron")
+
+uni.tort <- clogit(formula = resp ~ daily.tort_sc + strata(day) + cluster(pair.id), data = model.dat.paired,
+                   model=TRUE,x=TRUE, y=TRUE,method = "efron")
+
+uni.disp.m <- clogit(formula = resp ~ mean.disp_m_sc + strata(day) + cluster(pair.id), data = model.dat.paired,
+                     model=TRUE,x=TRUE, y=TRUE,method = "efron")
+
+uni.log.disp.m <- clogit(formula = resp ~ mean.disp_m_log_sc + strata(day) + cluster(pair.id), data = model.dat.paired,
+                         model=TRUE,x=TRUE, y=TRUE,method = "efron")
+
+
+aics <- AIC(
+  uni.mean.speed,
+  uni.var.speed,
+  uni.dist.m ,
+  uni.tort,
+  uni.disp.m,
+  uni.log.disp.m
+)
+aics[order(aics$AIC),]
+```
+
+Based on these results, we'll keep movement rate, not daily distance. In addition, we'll exclude variance, because that metric was also correlated with movement rate. Lastely, we'll use log-transformed displacement instead of non-transformed. Now we can move forward and fit our full models.  
+
+
+## Full models
+
+We used the full dataset for univariate models, but following [Barrile et al. 2024](https://doi.org/10.1002/ece3.11418), we'll fit the full models separately for each month prior to case death. 
+
+```{r monthly-full-models}
+#### fit monthly models ####
+months.pre.death <- 1:6
+daily.models.by.month <- NULL
+
+for(i in 1:length(months.pre.death)){
+  
+  ## extract data for the given month pre-case death
+  temp.daily.dat <- model.dat.paired[model.dat.paired$mpd==months.pre.death[i],]
+  
+  ## fit the full model
+  cl.mod <- clogit(resp ~ mean.km_p_hr_sc + daily.tort_sc + mean.disp_m_log_sc + strata(day) + cluster(pair.id), data = temp.daily.dat, 
+                   model=TRUE,x=TRUE, y=TRUE,method = "efron")
+  
+  ## extract results and store results
+  pop.out <- as.data.frame(summary(cl.mod)$coefficients)
+  
+  pop.out$mpd <- months.pre.death[i]
+  
+  daily.models.by.month <- rbind(daily.models.by.month, pop.out)
+}
+
+
+head(daily.models.by.month)
+```
+
+
+With these results, we can add our 95% confidence intervals and save out to a .csv file.
+
+```{r CIs-save}
+daily.models.by.month$upper <- daily.models.by.month$coef + (1.96*daily.models.by.month$`robust se`)
+daily.models.by.month$lower <- daily.models.by.month$coef - (1.96*daily.models.by.month$`robust se`)
+# write.csv(daily.models.by.month, "Output/CLR_daily_model_results.csv", row.names = F)
+```
+
+
+## Plot some results
+
+Lastly, we can plot some of our results. Each plot in the manuscript was made in this manner, so I'll just demonstrate with the results for movement rates. 
+
+```{r plot-demo}
+#### movement rate ####
+ggplot(daily.models.by.month[grepl("mean.km_p_hr", rownames(daily.models.by.month)),]) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkgrey") +
+  geom_errorbar(aes(x = mpd, ymin = lower, ymax = upper), width = 0.1) +
+  geom_point(aes(x = mpd, y = coef), size = 2) +
+  geom_path(aes(x = mpd, y = coef)) +
+  scale_x_continuous(trans = "reverse", breaks = seq(6, 1, by = -1), labels = seq(6, 1, by = -1)) +
+  xlab("Months prior to case death") + ylab("\u03B2: Mean movement rate (km/hr)") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12))
+
+## save as a jpeg
+# ggsave("Figures/CLR_results/daily_rate_CLR.jpeg", dpi = 300, width = 5, height = 3.5, units = "in")
+
+```
+
+And that's it! I'll close with my session info:
+
+```{r session-info}
+sessionInfo()
+```
