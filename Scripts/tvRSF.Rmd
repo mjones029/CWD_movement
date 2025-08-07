@@ -1,0 +1,1629 @@
+---
+title: "Time-varying resource selection functions"
+author: "Marie Gilbertson"
+date: "2025-07-24"
+knit: (function(inputFile, encoding) {
+      out_dir <- "../Markdown_reports";
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_dir=file.path(dirname(inputFile), out_dir))})
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this report, I demo the process we used to:  
+
+1. Fit time-varying resource selection functions (tvRSFs) to white-tailed deer movement data. 
+2. Test for changepoints in tvRSF results
+3. Perform conditional logistic regression (CLR) to determine if tvRSF results are predictive of CWD status.
+
+
+The tvRSF methods and code are derived from [Romain et al 2024](https://doi.org/10.1002/ecy.4233), and the changepoint and conditional logistic regression approaches are based on [Barrile et al. 2024](https://doi.org/10.1002/ece3.11418). 
+
+
+For data ownership reasons, the data is not publicly available. However, I will preview the data structure so others can adapt this approach for themselves. Readers interested in data access should contact Daniel Storm at the Wisconsin Department of Natural Resources.
+
+We'll start by loading the packages we'll need. I also always set my seed as standard practice (this makes randomization reproducible).
+
+```{r load-libraries, results='hide', message=FALSE, warning=FALSE}
+
+#### Clear Environment ####
+remove(list=ls())
+
+
+#### set seed ####
+set.seed(254123)
+
+
+#### load libraries ####
+library(raster)
+library(adehabitatHR)
+library(plyr)
+library(dplyr)
+library(amt)
+library(tidyr)
+library(dynamichazard)
+library(ggplot2)
+library(sf)
+library(terra)
+library(ctmm)
+library(move)
+library(foreach)
+library(doParallel)
+library(doSNOW)
+library(ggpubr)
+library(lubridate)
+library(RColorBrewer)
+library(GGally)
+
+```
+
+We will use a custom function later on, and we can load that here.
+```{r custom-functions}
+
+## Function for extracting tvRSF results; this is from code provided in the Romain et al. publication at the beginning of this document 
+Outcome_tRSF = function(dd_fit_SMA){
+  
+  var_tab = data.frame(dd_fit_SMA$state_vars)
+  df_dd = data.frame(t=dd_fit_SMA$times)
+  for (nb_var in 1:length(rownames(var_tab))){
+    df_dd <- cbind(df_dd, data.frame("beta_habitat" = dd_fit_SMA$state_vecs[,nb_var]))
+    # IC
+    variance = as.numeric(var_tab[nb_var,seq(nb_var,length(names(var_tab)),length(rownames(var_tab)))])
+    ci <- df_dd$beta_habitat+sqrt(variance)%*%t(qnorm(c(0.025,0.975)))
+    dimnames(ci)[[2]]<-c("habitat_lower95", "habitat_upper95")
+    df_dd <- cbind(df_dd,ci)    
+    
+    colnames(df_dd)[(2+(3*(nb_var-1))):(4+(3*(nb_var-1)))] <- c(rownames(var_tab)[nb_var],
+                                                                paste0(rownames(var_tab)[nb_var],"_lower95"),
+                                                                paste0(rownames(var_tab)[nb_var],"_upper95"))
+  }
+  return(df_dd)
+}  
+
+```
+
+
+### Load data
+
+We'll start by loading our white-tailed deer movement data. We'll fit the time-varying RSFs on two different sets of data: the matched, re-sampled case-control movement data (i.e., each pair has matching fix rates), and a down-sampled set of movement data that we will generate. In the latter case, we will down-sample our data to two locations per day to mitigate the effects of temporal autocorrelation. Temporal autocorrelation in RSFs can generate appropriate parameter estimates but "overly confident" (i.e., overly narrow) confidence intervals, resulting in non-conservative inference. Our primary objective here is to look for evidence of temporal variation in selection, in which case a descriptive analysis with temporally autocorrelated data is acceptable. However, we should also verify that temporal autocorrelation is not impacting our actual estimates.
+
+Note that down-sampling is not an ideal method for dealing with temporal autocorrelation in RSFs, which is why weighted RSFs from the continuous-time movement modeling (CTMM) platform are really useful. However, the CTMM approach does not allow for time-varying habitat selection, which is why we're focusing on the tvRSF approach. 
+
+```{r load-movement-data}
+data <- get(load("../Project_data/case_control_collar_and_metadata.Rdata"))
+## case-control metadata
+meta <- data$meta.data
+
+## resampled, matched step data for cases and controls (i.e., each individual in a pair has matching fix rates)
+dat <- get(load("../Project_data/resampled_matched_step_data.Rdata"))
+
+## convert from steps to point/track data for downsampling purposes
+ids <- unique(dat$id)
+pts <- NULL
+for(i in 1:length(ids)){
+  pt1 <- dat[dat$id==ids[i],c("id", "pair.id", "class", "mpd", "x1_", "y1_", "t1_")]
+  pt2 <- tail(dat[dat$id==ids[i],c("id", "pair.id", "class", "mpd", "x2_", "y2_", "t2_")],1)
+  colnames(pt2) <- colnames(pt1)
+  temp.pts <- rbind(pt1, pt2)
+  pts <- rbind(pts, temp.pts)
+}
+pts$day <- as.Date(pts$t1_, tz = "Canada/Saskatchewan")
+
+## make a nested tibble for this matched (resampled) data; we'll add the downsampled data to keep everything together
+trk.dat <- pts %>% make_track(.x = x1_, .y = y1_, .t = t1_, id = id, pair.id = pair.id, class = class, mpd = mpd, day = day, crs = 3071)
+trk.dat <- trk.dat %>% nest(match.data = c(-"id",  -"pair.id", -"class"))
+
+## downsample
+nest.dat <- trk.dat %>%
+  mutate(downsamp.data = lapply(match.data, function(x){
+    x %>% amt::track_resample(rate = hours(12), tolerance = minutes(90))
+  }))
+
+## preview nested data tibble
+head(nest.dat)
+
+## preview the "full" dataset (fix rates equivalent within a pair)
+str(nest.dat$match.data[[1]])
+
+## preview the downsampled data
+str(nest.dat$downsamp.data[[1]])
+```
+
+
+
+Now that we've loaded and prepped the movement data, we need to load our landscape data. Based on previous step-selection analysis results (see [Gilbertson et al 2025](https://doi.org/10.1002/wmon.70001)) and CWD pathology (i.e., CWD causes polydipsia), we'll fit RSFs including:  
+1. distance to water sources  
+2. forest versus non-forested land use class  
+3. distance to nearest forest edge  
+4. aspect (i.e., eastness and northness)  
+
+The specific sources for these rasters are described in the manuscript for this project. 
+
+```{r load-land-data}
+wat.dist <- rast("../Project_data/water_dist_cleaned.tif")
+names(wat.dist) <- "wat.dist"
+
+lu <- rast("../Project_data/landuse_cropped.tif")
+activeCat(lu) <- 3 # active category becomes level 2 land use classes
+names(lu) <- "lu"
+
+fe.dist <- rast("../Project_data/distance_to_forest_edge_raster.tif")
+names(fe.dist) <- "fe.dist"
+
+east <- rast("../Project_data/aspect_eastness.tif")
+names(east) <- "eastness"
+
+north <- rast("../Project_data/aspect_northness.tif")
+names(north) <- "northness"
+```
+
+
+### Draw random "available" points
+
+For our tvRSF analysis, we will randomly draw random "available" points for each observed deer location. What consistutes "available," however, can be tricky to define. Here, we will base "availability" on locations within an individual's home range. Adding complexity to the matter, some individuals have range shift events during the course of our observations (e.g., dispersal events). If we consider the natal range "available" post dispersal, we may not get the picture of habitat selection that we are looking for.  
+
+As such, we will generate 90% isopleths for each individual's occurrence distribution (assuming Brownian movement). In contrast to an aKDE for a non-range resident individual, an occurrence distribution's area won't be massively inflated. Such inflation is particularly problematic for defining "availability," as large swaths of habitat would be considered available when they really weren't. We're doing the 90% isopleths to again limit some of the area inflation associated with range shift events and excursions.  
+
+Note: generating these occurrence distribution polygons can take several minutes, depending on the number of individuals you are evaluating.
+
+```{r occur-dist, eval=FALSE}
+
+set.seed(651)
+nest.dat$occ.poly <- list(NA)
+
+UD.iso = 0.9
+
+## optional progress bar
+# pb = txtProgressBar(min = 0, max = nrow(nest.dat), initial = 0, style = 3) 
+
+for(i in 1:nrow(nest.dat)){
+  ## part of optional progress bar
+  # setTxtProgressBar(pb,i)
+  
+  loc.data <- data.frame(nest.dat$match.data[i][[1]])
+  
+  # make "move" object
+  pre.m <- move(x = loc.data$x_, y = loc.data$y_,
+                    time = loc.data$t_,
+                    proj = CRS("+init=epsg:6610"),
+                    data = loc.data, 
+                    animal = nest.dat$id[i])
+      
+      
+    # make the "move" object a "telemetry" object
+    pre.t <- as.telemetry(pre.m, timezone = "Canada/Saskatchewan")
+      
+    
+    # Brownian movement model
+    tm <- ctmm.fit(pre.t, ctmm::ctmm(tau = Inf))
+    # generate occurrence distribution
+    to <- occurrence(pre.t, CTMM = tm, res.space = 1, res.time = 10)
+    
+    # extract 90% polygon
+    poly <- as.sf(to, level.UD = UD.iso, level = 0.95, crs = 6610)
+    # assign the correct CRS
+    st_crs(poly) <- 6610
+    
+    # plot (optional)
+    # ggplot() +
+    #   geom_path(data = loc.data, aes(x = x_, y = y_)) +
+    #   geom_sf(data = poly, fill = "transparent") +
+    #   theme_bw()
+    
+    # extract area in km^2
+    poly$area.km <- as.numeric(st_area(poly))/(1000^2)
+    # make sure output is of type "polygon" (the warnings here can just be ignored)
+    suppressWarnings(poly <- st_cast(poly, "POLYGON"))
+    
+    ## determine the date range of points occurring within each polygon
+    # exclude polygons with area <0.1km^2 (these are basically tiny points)
+    loc.sf <- st_as_sf(loc.data, coords = c("x_", "y_"), crs = 6610)
+    poly$end <- poly$start <- NA
+    for(j in 1:nrow(poly)){
+        
+      in.points <- st_filter(loc.sf, poly[j,])
+      if(nrow(in.points)<1 & (as.numeric(st_area(poly[j,]))/(1000^2))<0.1){
+        next
+      }else if(nrow(in.points)<1 & (as.numeric(st_area(poly[j,]))/(1000^2))>=0.1){
+        stop("Large polygon with no points")
+      }else{
+        poly$start[j] <- paste(min(in.points$t_))
+        poly$end[j] <- paste(max(in.points$t_))
+      }
+    }
+    
+    nest.dat$occ.poly[[i]] <- poly
+}
+
+## save output
+# save(nest.dat, file = "../Project_data/time_var_RSF_polys.Rdata")
+```
+
+
+
+Let's take a look at some of the occurrence distribution polygons we've generated.  
+
+```{r eval-tv-polys}
+## load the saved polygons
+nest.dat <- get(load("../Project_data/time_var_RSF_polys.Rdata"))
+
+nest.dat <- nest.dat %>%
+  mutate(occ.area = lapply(occ.poly, function(x){
+    max(x$area.km)
+  }))
+nest.dat$occ.area <- unlist(nest.dat$occ.area)
+hist(nest.dat$occ.area, main = "Histogram of occurrence distribution area", xlab = "Area (km^2)")
+
+```
+
+We have a few exceptionally large occurrence distributions; let's take a peak at those.
+
+```{r check-large-ODs}
+
+big.areas <- which(nest.dat$occ.area>5)
+
+temp.dat <- nest.dat$match.data[big.areas[1]][[1]]
+temp.poly <- nest.dat$occ.poly[big.areas[1]][[1]]
+
+p1 <- ggplot() +
+  geom_path(data = temp.dat, aes(x = x_, y = y_)) +
+  geom_sf(data = temp.poly, fill = "transparent", colour = "red") +
+  theme_bw()
+
+temp.dat <- nest.dat$match.data[big.areas[2]][[1]]
+temp.poly <- nest.dat$occ.poly[big.areas[2]][[1]]
+
+p2 <- ggplot() +
+  geom_path(data = temp.dat, aes(x = x_, y = y_)) +
+  geom_sf(data = temp.poly, fill = "transparent", colour = "red") +
+  theme_bw()
+
+
+temp.dat <- nest.dat$match.data[big.areas[3]][[1]]
+temp.poly <- nest.dat$occ.poly[big.areas[3]][[1]]
+
+p3 <- ggplot() +
+  geom_path(data = temp.dat, aes(x = x_, y = y_)) +
+  geom_sf(data = temp.poly, fill = "transparent", colour = "red") +
+  theme_bw()
+
+ggarrange(p1, p2, p3)
+```
+
+None of these look particularly worrying - they align with what the animal was doing at the time - so we can proceed from here and use these polygons as the areas in which to randomly draw our "available" points. However, we don't know if the number of available points per used point will affect our downstream tvRSF results. Further, we know from Romain et al 2024 (see link in the Introduction) that the initial value for Q can have an impact on results (high values - 2 is considered high - are preferable, but the authors recommend testing several values). **And** we have our ongoing question about how temporal autocorrelation might affect selection estimates. With these uncertainties in mind, we can perform our tvRSF analysis many times, using a full factorial design to vary the number of available ("control") points, the initial value for Q, and which dataset we're using ("full" or "downsampled"). Let's create a dataframe documenting all these variations.
+
+```{r tv-RSF-prep}
+## table for all runs/iterations of 
+rsf.runs <- expand.grid(n_control = c(10, 20, 50, 100),
+            q = c(0.1, 0.5, 2, 4),
+            data.set = c("full", "downsampled")
+)
+rsf.runs$run <- seq(1, nrow(rsf.runs))
+
+
+```
+
+
+Drawing random points while accounting for when occurrence distribution polygons were in use takes a LONG time, so I did the below with high-throughput computing resources.
+```{r tv-random-pts, eval=FALSE}
+#!/usr/bin/env Rscript
+## HT_RSF_randompoints.R
+
+### Clear Environment ###
+remove(list=ls())
+
+#### load libraries ####
+library(plyr)
+library(dplyr)
+library(amt)
+library(tidyr)
+library(sf)
+library(lubridate)
+
+#### set index ####
+i <- as.numeric(commandArgs(TRUE[1])) + 1
+
+#### load data ####
+nest.dat <- get(load("time_var_RSF_polys.Rdata"))
+
+
+nest.dat <- nest.dat %>%
+  mutate(occ.area = lapply(occ.poly, function(x){
+    max(x$area.km)
+  }))
+nest.dat$occ.area <- unlist(nest.dat$occ.area)
+
+
+
+#### table for all runs/iterations of RSF variations ####
+rsf.runs <- expand.grid(n_control = c(10, 20, 50, 100),
+                        q = c(0.1, 0.5, 2, 4),
+                        data.set = c("full", "downsampled")
+)
+rsf.runs$run <- seq(1, nrow(rsf.runs))
+
+
+#### single iteration ####
+set.seed(3541+i)
+n_control <- rsf.runs$n_control[i]
+q <- rsf.runs$q[i]
+data.set <- rsf.runs$data.set[i]
+
+ids <- unique(nest.dat$id)
+iter.out <- nest.dat
+iter.out$n_control <- n_control
+iter.out$iter <- paste("n", n_control,"_q", q, "_", data.set, sep = "")
+iter.out$rsf.data <- list(NA)
+
+
+
+for(j in 1:length(ids)){
+  print(j)
+  temp.id <- ids[j]
+  
+  ## random points
+  if(data.set=="full"){
+    data_track <- nest.dat$match.data[nest.dat$id==temp.id][[1]]
+  }else if(data.set=="downsampled"){
+    data_track <- nest.dat$downsamp.data[nest.dat$id==temp.id][[1]]
+  }
+  
+  data_track$case_ = TRUE
+  
+  HR_id1 <- nest.dat$occ.poly[nest.dat$id==temp.id][[1]]
+  HR_id1 <- HR_id1[!is.na(HR_id1$start) & !is.na(HR_id1$end),] # get rid of the tiny polygons with no points inside them
+  HR_id1$intervals <- interval(as.POSIXct(HR_id1$start, tz = "Canada/Saskatchewan"), as.POSIXct(HR_id1$end, tz = "Canada/Saskatchewan"))
+  
+  
+  data_track_rd <- data_track
+  data_track_rd$poly <- list(NA)
+  data_track_rd$poly <- lapply(data_track$t_, function(x) HR_id1[which(x %within% HR_id1$intervals),])
+  
+  rand.pts <- lapply(data_track_rd$poly, function(x) {
+    if(nrow(x)<1){
+      temp.rd <- random_points(HR_id1, n = n_control)
+    }else{
+      temp.rd <- random_points(x, n = n_control)
+    }
+    return(temp.rd)
+  })
+  
+  names(rand.pts) <- data_track_rd$t_
+  data_track_rd <- bind_rows(rand.pts, .id = "names")
+  colnames(data_track_rd) <- c("t_", "case_", "x_", "y_")
+  data_track_rd <- data_track_rd[,c("case_", "x_", "y_", "t_")]
+  data_track_rd$t_ <- as.POSIXct(data_track_rd$t_, tz = "Canada/Saskatchewan")
+  
+ 
+  
+  data_track_rd <- rbind(data_track_rd,
+                         data.frame("case_" = data_track$case_,
+                                    "x_" = data_track$x_,
+                                    "y_" = data_track$y_,
+                                    "t_" = data_track$t_))
+  
+
+  data_track_rsf <- data_track_rd[order(data_track_rd$t_, -data_track_rd$case_),]
+  
+  iter.out$rsf.data[[j]] <- data_track_rsf
+}
+
+file.name <- paste0("time_varying_RSF_data_n", n_control, "_q", q, "_", data.set, ".Rdata")
+save(iter.out, file = file.name)
+
+```
+
+
+
+Once we've drawn all our random points, we can read in the high-throughput generated data, extract covariates, and fit the time-varying RSFs. This is "stupidly parallel," though, so I ran it in parallel across several cores to speed things up. 
+```{r tv-RSF-loop, eval=FALSE}
+#### RSF loop ####
+
+cl <- makeCluster(4)
+# registerDoParallel(cl)
+registerDoSNOW(cl)
+
+clusterEvalQ(cl, {
+  library(raster)
+  library(adehabitatHR)
+  library(plyr)
+  library(dplyr)
+  library(amt)
+  library(tidyr)
+  library(dynamichazard)
+  library(ggplot2)
+  library(sf)
+  library(terra)
+  library(ctmm)
+  library(move)
+  library(foreach)
+  library(doParallel)
+  library(doSNOW)
+  library(lubridate)
+
+})
+
+
+pb <- txtProgressBar(max = nrow(rsf.runs), style = 3)
+progress <- function(n) setTxtProgressBar(pb, n)
+opts <- list(progress = progress)
+
+
+par.out <- foreach(i = 1:nrow(rsf.runs), .options.snow = opts) %dopar% {
+
+  ## load custom function within parallel loop so available across cores
+  Outcome_tRSF = function(dd_fit_SMA){
+  
+  var_tab = data.frame(dd_fit_SMA$state_vars)
+  df_dd = data.frame(t=dd_fit_SMA$times)
+  for (nb_var in 1:length(rownames(var_tab))){
+    df_dd <- cbind(df_dd, data.frame("beta_habitat" = dd_fit_SMA$state_vecs[,nb_var]))
+    # IC
+    variance = as.numeric(var_tab[nb_var,seq(nb_var,length(names(var_tab)),length(rownames(var_tab)))])
+    ci <- df_dd$beta_habitat+sqrt(variance)%*%t(qnorm(c(0.025,0.975)))
+    dimnames(ci)[[2]]<-c("habitat_lower95", "habitat_upper95")
+    df_dd <- cbind(df_dd,ci)    
+    
+    colnames(df_dd)[(2+(3*(nb_var-1))):(4+(3*(nb_var-1)))] <- c(rownames(var_tab)[nb_var],
+                                                                paste0(rownames(var_tab)[nb_var],"_lower95"),
+                                                                paste0(rownames(var_tab)[nb_var],"_upper95"))
+  }
+  return(df_dd)
+  } 
+  
+  ## need to re-read in landscape data when running in parallel
+  wat.dist <- rast("../Project_data/water_dist_cleaned.tif")
+  names(wat.dist) <- "wat.dist"
+  
+  lu <- rast("../Project_data/landuse_cropped.tif")
+  activeCat(lu) <- 3 # active category becomes level 2 land use classes
+  names(lu) <- "lu"
+  
+  fe.dist <- rast("../Project_data/distance_to_forest_edge_raster.tif")
+  names(fe.dist) <- "fe.dist"
+  
+  east <- rast("../Project_data/aspect_eastness.tif")
+  names(east) <- "eastness"
+  
+  north <- rast("../Project_data/aspect_northness.tif")
+  names(north) <- "northness"
+  
+  set.seed(3541)
+  n_control <- rsf.runs$n_control[i]
+  q <- rsf.runs$q[i]
+  data.set <- rsf.runs$data.set[i]
+  
+  ids <- unique(nest.dat$id)
+  
+  ## read in location data with random steps 
+  file.name <- paste0("../Project_data/time_varying_RSF_data/time_varying_RSF_data_n", n_control, "_q", q, "_", data.set, ".Rdata")
+  iter.out <- get(load(file.name))
+  
+  iter.out$rsf.out <- list(NA)
+  iter.out$rsf.cov.dat <- list(NA)
+      
+  for(j in 1:length(ids)){
+    print(j)
+    temp.id <- ids[j]
+    
+    data_track_rsf <- iter.out$rsf.data[iter.out$id==temp.id][[1]]
+    
+    
+    ## extract covariates
+    data_track_rsf_out <- data_track_rsf %>% 
+      make_track(x_, y_, t_, 
+                 id = temp.id,
+                 crs = 3071,
+                 all_cols=T) %>% 
+      extract_covariates(wat.dist,  where = "end") %>% 
+      extract_covariates(lu,  where = "end") %>% 
+      extract_covariates(fe.dist, where = "end") %>%
+      extract_covariates(east,  where = "end") %>% 
+      extract_covariates(north,  where = "end") %>%
+        group_by(t_) %>%
+        mutate(numeric_time = cur_group_id(),
+               numeric_time = as.numeric(numeric_time),
+               case_num = ifelse(case_ == FALSE, 0,1)) %>%
+        ungroup(t_) %>%
+        drop_na() %>%
+        dplyr::select(case_,case_num, numeric_time,x_, y_, t_,wat.dist, lu, fe.dist, eastness, northness) %>%
+        mutate(wat.dist_sc = as.numeric(scale(wat.dist)),
+               fe.dist_sc = as.numeric(scale(fe.dist)))
+      
+    
+
+    data_track_rsf_out$forest <- factor(ifelse(data_track_rsf_out$lu==4200, "1", "0"))
+    
+    
+    ## fit the time-varying RSF
+    dd_fit_SMA <- NULL
+    try(
+      suppressMessages(
+      dd_fit_SMA <-ddhazard(Surv(numeric_time, case_num) ~  wat.dist_sc + forest + fe.dist_sc + eastness + northness,
+                              data_track_rsf_out,
+                              by = 1,
+                              max_T = max(data_track_rsf_out$numeric_time),
+                              Q_0 = diag(q, 6),
+                              Q = diag(q, 6),
+                              control = ddhazard_control(method = "SMA", eps = 0.01))
+      ),
+    silent = T)
+    
+    if(!is.null(dd_fit_SMA)){
+      ## extract output
+      df_dd = Outcome_tRSF(dd_fit_SMA)
+      
+      data.out <- left_join(df_dd, data_track_rsf_out[data_track_rsf_out$case_,], by = c("t" = "numeric_time"))
+      
+      iter.out$rsf.out[iter.out$id==temp.id][[1]] <- data.out
+    }
+    
+    ## save back just the rsf data (no added rsf results) so have these regardless of whether or not the model converged
+    iter.out$rsf.cov.dat[iter.out$id==temp.id][[1]] <- data_track_rsf_out
+    
+  }
+  
+  out.filename <- paste0("../Project_data/time_varying_RSF_output_n", n_control, "_q", q, "_", data.set, ".Rdata")
+  save(iter.out, file = out.filename)
+}
+close(pb)
+stopCluster(cl)
+```
+
+
+Once we've run all our tvRSF models, we can review how the results vary across our different parameterizations - namely, the effect of the number of control points per observed point, and the effect of the initial Q parameter. We start by loading in the different sets of results data and summarizing the results.
+
+```{r tv-rsf-explore-sensitivity, warning=FALSE, message=FALSE}
+rsf.runs <- expand.grid(n_control = c(10, 20, 50, 100),
+                        q = c(0.1, 0.5, 2, 4),
+                        data.set = c("full", "downsampled")
+)
+rsf.runs$run <- seq(1, nrow(rsf.runs))
+tv.rsf.out <- NULL
+tv.rsf.nofit <- NULL
+
+for(i in 1:nrow(rsf.runs)){
+  # print(i)
+  file.name <- paste0("../Project_data/tvRSF_sensitivity/time_varying_RSF_output_n", rsf.runs$n_control[i], "_q", rsf.runs$q[i], "_", rsf.runs$data.set[i], ".Rdata")
+  temp <- get(load(file.name))
+  
+  temp.rsf.out <- NULL
+  for(j in 1:nrow(temp)){
+    td <- temp$rsf.out[[j]]
+    
+    if(is.null(nrow(td))){
+      nofit <- data.frame(id=temp$id[j],
+                          pair.id=temp$pair.id[j],
+                          class=temp$class[j],
+                          n_control=rsf.runs$n_control[i],
+                          q=rsf.runs$q[i],
+                          data.set=rsf.runs$data.set[i],
+                          run = rsf.runs$run[i])
+      tv.rsf.nofit <- rbind(tv.rsf.nofit, nofit)
+      next
+    } 
+    
+    ## add "time pre-death" to tvRSF results
+    if(temp$class[j]=="case"){
+      tm <- meta[meta$cand.case==temp$id[j],]
+    }else{
+      tm <- meta[meta$lowtag==temp$id[j],]
+    }
+    
+    end.date <- as.Date(tm$case_mort.date, tz = "Canada/Saskatchewan")
+
+    year <- format(max(td$t_, na.rm = T), "%Y")
+    end.day <- format(end.date, "%m-%d")
+    if(end.day=="02-29"){
+      end.day <- "02-28"
+    }
+    end.date <- as.Date(paste0(year, "-", end.day), tz = "Canada/Saskatchewan")
+    
+    td$t_day <- as.Date(td$t_, tz = "Canada/Saskatchewan")
+    td$time_pre_death_days <- as.numeric(difftime(end.date, td$t_day, units = "days"))
+    
+    if(any(na.omit(abs(td$time_pre_death))>190) | any(na.omit(td$time_pre_death)<(-1))){
+      stop("Days pre-death is wrong somewhere!")
+    }
+    
+    ## extract mean estimate per day-pre-death
+    t.out <- ddply(td, .(time_pre_death_days), function(x) mean(x$`(Intercept)`))
+    colnames(t.out) <- c("time_pre_death_days", "mean.intercept")
+    
+    t.wat <- ddply(td, .(time_pre_death_days), function(x) mean(x$wat.dist_sc.x))
+    colnames(t.wat) <- c("time_pre_death_days", "mean.wat.dist_sc")
+    
+    t.for <- ddply(td, .(time_pre_death_days), function(x) mean(x$forest1))
+    colnames(t.for) <- c("time_pre_death_days", "mean.forest1")
+    
+    t.fe <- ddply(td, .(time_pre_death_days), function(x) mean(x$fe.dist_sc.x))
+    colnames(t.fe) <- c("time_pre_death_days", "mean.fe.dist_sc")
+    
+    t.east <- ddply(td, .(time_pre_death_days), function(x) mean(x$eastness.x))
+    colnames(t.east) <- c("time_pre_death_days", "mean.eastness")
+
+    t.north <- ddply(td, .(time_pre_death_days), function(x) mean(x$northness.x))
+    colnames(t.north) <- c("time_pre_death_days", "mean.northness")
+    
+    
+    t.out <- left_join(t.out, t.wat, by = "time_pre_death_days")
+    t.out <- left_join(t.out, t.for, by = "time_pre_death_days")
+    t.out <- left_join(t.out, t.fe, by = "time_pre_death_days")
+    t.out <- left_join(t.out, t.east, by = "time_pre_death_days")
+    t.out <- left_join(t.out, t.north, by = "time_pre_death_days")
+    
+    ## add tracking info
+    t.out$id <- temp$id[j]
+    t.out$pair.id <- temp$pair.id[j]
+    t.out$class <- temp$class[j]
+    t.out$n_control <- rsf.runs$n_control[i]
+    t.out$q <- rsf.runs$q[i]
+    t.out$data.set <- rsf.runs$data.set[i]
+    t.out$run <- rsf.runs$run[i]
+    
+    
+    temp.rsf.out <- rbind(temp.rsf.out, t.out)
+  }
+  tv.rsf.out <- rbind(tv.rsf.out, temp.rsf.out)
+}
+
+## two individuals failed to fit, but they had very limited movement data
+nofit.counts <- ddply(tv.rsf.nofit, .(run), nrow)
+# summary(nofit.counts)
+# unique(tv.rsf.nofit$id)
+
+
+## take means for each run by day pre-death and class (case/control)
+means.rsf <- ddply(tv.rsf.out, .(time_pre_death_days, run, n_control, q, data.set, class), function(x) mean(x$mean.intercept, na.rm = T))
+means.wat <- ddply(tv.rsf.out, .(time_pre_death_days, run, n_control, q, data.set, class), function(x) mean(x$mean.wat.dist_sc, na.rm = T))
+means.for <- ddply(tv.rsf.out, .(time_pre_death_days, run, n_control, q, data.set, class), function(x) mean(x$mean.forest1, na.rm = T))
+means.fe <- ddply(tv.rsf.out, .(time_pre_death_days, run, n_control, q, data.set, class), function(x) mean(x$mean.fe.dist_sc, na.rm = T))
+means.east <- ddply(tv.rsf.out, .(time_pre_death_days, run, n_control, q, data.set, class), function(x) mean(x$mean.eastness, na.rm = T))
+means.north <- ddply(tv.rsf.out, .(time_pre_death_days, run, n_control, q, data.set, class), function(x) mean(x$mean.northness, na.rm = T))
+
+colnames(means.rsf)[colnames(means.rsf)=="V1"] <- "mean.intercept"
+colnames(means.wat)[colnames(means.wat)=="V1"] <- "mean.wat.dist_sc"
+colnames(means.for)[colnames(means.for)=="V1"] <- "mean.forest1"
+colnames(means.fe)[colnames(means.fe)=="V1"] <- "mean.fe.dist_sc"
+colnames(means.east)[colnames(means.east)=="V1"] <- "mean.eastness"
+colnames(means.north)[colnames(means.north)=="V1"] <- "mean.northness"
+
+means.rsf <- left_join(means.rsf, means.wat, by = c("time_pre_death_days", "run", "n_control", "q", "data.set", "class"))
+means.rsf <- left_join(means.rsf, means.for, by = c("time_pre_death_days", "run", "n_control", "q", "data.set", "class"))
+means.rsf <- left_join(means.rsf, means.fe, by = c("time_pre_death_days", "run", "n_control", "q", "data.set", "class"))
+means.rsf <- left_join(means.rsf, means.east, by = c("time_pre_death_days", "run", "n_control", "q", "data.set", "class"))
+means.rsf <- left_join(means.rsf, means.north, by = c("time_pre_death_days", "run", "n_control", "q", "data.set", "class"))
+```
+
+Next, we'll make a bunch of plots to review the sensitivity of our tvRSF estimates to the different parameterizations we used. 
+
+```{r tv-rsf-plot-sensitivity, warning=FALSE}
+## plot
+class.labs <- c("Cases", "Controls")
+names(class.labs) <- c("case", "control")
+dataset.labs <- c("Full dataset", "Downsampled dataset")
+names(dataset.labs) <- c("full", "downsampled")
+
+library(MetBrewer)
+control.pal <- rev(met.brewer("Tam", n = 4))
+q.pal <- (met.brewer("Hokusai3", n = 4))
+
+
+ggplot(means.rsf, aes(x = time_pre_death_days, y = mean.intercept, group = factor(run), colour = factor(n_control))) +
+  geom_line() +
+  scale_colour_manual(values = control.pal, name = "Number of\ncontrol points") +
+  facet_grid(data.set~class, labeller = labeller(data.set = dataset.labs, class = class.labs)) +
+  ggtitle("Intercept") +
+  xlab("Days prior to case death") + ylab("Time-varying RSF estimate") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 11), axis.title = element_text(size = 12), strip.text = element_text(size = 12),
+        legend.title = element_text(size = 12), legend.text = element_text(size = 11)) 
+
+
+ggplot(means.rsf, aes(x = time_pre_death_days, y = mean.wat.dist_sc, group = factor(run), colour = factor(q))) +
+  geom_line() +
+  scale_colour_manual(values = q.pal, name = "Q (wiggliness\nparameter)") +
+  facet_grid(data.set~class, labeller = labeller(data.set = dataset.labs, class = class.labs)) +
+  ggtitle("Water distance (scaled and centered)") +
+  xlab("Days prior to case death") + ylab("Time-varying RSF estimate") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 11), axis.title = element_text(size = 12), strip.text = element_text(size = 12),
+        legend.title = element_text(size = 12), legend.text = element_text(size = 11)) 
+
+
+ggplot(means.rsf, aes(x = time_pre_death_days, y = mean.forest1, group = factor(run), colour = factor(q))) +
+  geom_line() +
+  scale_colour_manual(values = q.pal, name = "Q (wiggliness\nparameter)") +
+  facet_grid(data.set~class, labeller = labeller(data.set = dataset.labs, class = class.labs)) +
+  ggtitle("Forest") +
+  xlab("Days prior to case death") + ylab("Time-varying RSF estimate") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 11), axis.title = element_text(size = 12), strip.text = element_text(size = 12),
+        legend.title = element_text(size = 12), legend.text = element_text(size = 11)) 
+
+
+ggplot(means.rsf, aes(x = time_pre_death_days, y = mean.fe.dist_sc, group = factor(run), colour = factor(q))) +
+  geom_line() +
+  scale_colour_manual(values = q.pal, name = "Q (wiggliness\nparameter)") +
+  facet_grid(data.set~class, labeller = labeller(data.set = dataset.labs, class = class.labs)) +
+  ggtitle("Forest edge distance (scaled and centered)") +
+  xlab("Days prior to case death") + ylab("Time-varying RSF estimate") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 11), axis.title = element_text(size = 12), strip.text = element_text(size = 12),
+        legend.title = element_text(size = 12), legend.text = element_text(size = 11)) 
+
+
+ggplot(means.rsf, aes(x = time_pre_death_days, y = mean.eastness, group = factor(run), colour = factor(q))) +
+  geom_line() + 
+  scale_colour_manual(values = q.pal, name = "Q (wiggliness\nparameter)") +
+  facet_grid(data.set~class, labeller = labeller(data.set = dataset.labs, class = class.labs)) +
+  ggtitle("Eastness") +
+  xlab("Days prior to case death") + ylab("Time-varying RSF estimate") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 11), axis.title = element_text(size = 12), strip.text = element_text(size = 12),
+        legend.title = element_text(size = 12), legend.text = element_text(size = 11)) 
+
+
+ggplot(means.rsf, aes(x = time_pre_death_days, y = mean.northness, group = factor(run), colour = factor(q))) +
+  geom_line() +
+  scale_colour_manual(values = q.pal, name = "Q (wiggliness\nparameter)") +
+  facet_grid(data.set~class, labeller = labeller(data.set = dataset.labs, class = class.labs)) +
+  ggtitle("Northness") +
+  xlab("Days prior to case death") + ylab("Time-varying RSF estimate") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 11), axis.title = element_text(size = 12), strip.text = element_text(size = 12),
+        legend.title = element_text(size = 12), legend.text = element_text(size = 11)) 
+
+
+
+
+```
+
+From these figures, we can see that selection estimates for habitat covariates are robust to the number of control points, but are affected by lower values for q. However, q values 2 and 4 seem to give pretty comparable results. Let's move forward with 100 control points and q = 2. But first, we should also look more closely at the effect of downsampling versus using the whole (temporally autocorrelated) dataset. Let's start by plotting:
+
+```{r explore-downsample-sens, warning=FALSE, message=FALSE}
+### focus on full vs downsampled
+ggplot(means.rsf[means.rsf$n_control==100 & means.rsf$q==2,], aes(x = time_pre_death_days, y = mean.intercept, group = factor(run), colour = factor(data.set))) +
+  geom_line() +
+  facet_grid(~class) +
+  ggtitle("Intercept") +
+  theme_bw()
+
+ggplot(means.rsf[means.rsf$n_control==100 & means.rsf$q==2,], aes(x = time_pre_death_days, y = mean.wat.dist_sc, group = factor(run), colour = factor(data.set))) +
+  geom_line() +
+  facet_grid(~class) +
+  ggtitle("Water distance (scaled and centered)") +
+  theme_bw()
+
+ggplot(means.rsf[means.rsf$n_control==100 & means.rsf$q==2,], aes(x = time_pre_death_days, y = mean.forest1, group = factor(run), colour = factor(data.set))) +
+  geom_line() +
+  facet_grid(~class) +
+  ggtitle("Forest") +
+  theme_bw()
+
+ggplot(means.rsf[means.rsf$n_control==100 & means.rsf$q==2,], aes(x = time_pre_death_days, y = mean.fe.dist_sc, group = factor(run), colour = factor(data.set))) +
+  geom_line() +
+  facet_grid(~class) +
+  ggtitle("Forest edge distance (scaled and centered)") +
+  theme_bw()
+
+ggplot(means.rsf[means.rsf$n_control==100 & means.rsf$q==2,], aes(x = time_pre_death_days, y = mean.eastness, group = factor(run), colour = factor(data.set))) +
+  geom_line() +
+  facet_grid(~class) +
+  ggtitle("Eastness") +
+  theme_bw()
+
+ggplot(means.rsf[means.rsf$n_control==100 & means.rsf$q==2,], aes(x = time_pre_death_days, y = mean.wat.dist_sc, group = factor(run), colour = factor(data.set))) +
+  geom_line() +
+  facet_grid(~class) +
+  ggtitle("Northness") +
+  theme_bw()
+```
+
+Next, let's look at correlations between estimates from the full versus downsampled data. 
+
+```{r downsample-correlations, message=FALSE}
+### correlations
+sample.set <- means.rsf[means.rsf$n_control==100 & means.rsf$q==2,]
+sample.set <- sample.set[order(sample.set$time_pre_death_days, sample.set$run),]
+
+wat.cor <- cor(sample.set$mean.wat.dist_sc[sample.set$data.set=="full"], sample.set$mean.wat.dist_sc[sample.set$data.set=="downsampled"])
+forest.cor <- cor(sample.set$mean.forest1[sample.set$data.set=="full"], sample.set$mean.forest1[sample.set$data.set=="downsampled"])
+fe.dist.cor <- cor(sample.set$mean.fe.dist_sc[sample.set$data.set=="full"], sample.set$mean.fe.dist_sc[sample.set$data.set=="downsampled"])
+east.cor <- cor(sample.set$mean.eastness[sample.set$data.set=="full"], sample.set$mean.eastness[sample.set$data.set=="downsampled"])
+north.cor <- cor(sample.set$mean.northness[sample.set$data.set=="full"], sample.set$mean.northness[sample.set$data.set=="downsampled"])
+
+
+wat.dat <- data.frame(full = sample.set$mean.wat.dist_sc[sample.set$data.set=="full"],
+                      down = sample.set$mean.wat.dist_sc[sample.set$data.set=="downsampled"],
+                      var = "Distance to water")
+  
+forest.dat <- data.frame(full = sample.set$mean.forest1[sample.set$data.set=="full"],
+                      down = sample.set$mean.forest1[sample.set$data.set=="downsampled"],
+                      var = "Forest")
+  
+fe.dat <- data.frame(full = sample.set$mean.fe.dist_sc[sample.set$data.set=="full"],
+                      down = sample.set$mean.fe.dist_sc[sample.set$data.set=="downsampled"],
+                     var = "Distance to forest edge")
+  
+east.dat <- data.frame(full = sample.set$mean.eastness[sample.set$data.set=="full"],
+                      down = sample.set$mean.eastness[sample.set$data.set=="downsampled"],
+                      var = "Eastness")
+  
+north.dat <- data.frame(full = sample.set$mean.northness[sample.set$data.set=="full"],
+                      down = sample.set$mean.northness[sample.set$data.set=="downsampled"], 
+                      var = "Northness")
+  
+all.dat <- rbind(wat.dat, forest.dat, fe.dat, east.dat, north.dat)
+all.cors <- data.frame(var = unique(all.dat$var),
+                       cor = round(c(wat.cor, forest.cor, fe.dist.cor, east.cor, north.cor), 2),
+                       x = c(0.5, 2.8, 0.5, 0.5, 1),
+                       y = c(-0.5, 0.6, -0.5, -0.5, -0.3))
+
+all.dat$var <- factor(all.dat$var, levels = unique(all.dat$var))
+all.cors$var <- factor(all.cors$var, levels = unique(all.dat$var))
+library(ggh4x)
+
+p <- ggplot(all.dat, aes(x = full, y = down)) +
+    geom_abline(intercept = 0, slope = 1, colour = "grey", linetype = "dashed") +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~var, scales = "free") +
+  # xlim(-1, 4) + ylim(-1, 4) +
+  geom_text(data = all.cors, aes(x = x, y = y, label = paste('rho', "==", cor)),  parse = T, size = 5) +
+  xlab("Full dataset") + ylab("Downsampled dataset") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 11), axis.title = element_text(size = 12), strip.text = element_text(size = 12))
+
+p <- p + ggh4x::facetted_pos_scales(
+  y = list(
+  var == "Distance to water"~ scale_y_continuous(limits = c(-1, 1)), 
+  var == "Distance to forest edge"~ scale_y_continuous(limits = c(-1, 1)),
+  var == "Eastness"~ scale_y_continuous(limits = c(-1, 1)), 
+  var == "Northness" ~ scale_y_continuous(limits = c(-1, 1.8)),
+  var == "Forest" ~ scale_y_continuous(limits = c(-0.5, 4))
+  ),
+  x = list(
+  var == "Distance to water"~ scale_x_continuous(limits = c(-1, 1)), 
+  var == "Distance to forest edge"~ scale_x_continuous(limits = c(-1, 1)),
+  var == "Eastness"~ scale_x_continuous(limits = c(-1, 1)), 
+  var == "Northness" ~ scale_x_continuous(limits = c(-1, 1.8)),
+  var == "Forest" ~ scale_x_continuous(limits = c(-0.5, 4))
+  )
+)
+p
+
+```
+
+It looks like our habitat selection estimates are pretty consistent between full and downsampled datasets, though we would expect standard errors for our full dataset to be too low due to temporal autocorrelation. We aren't trying to make inference using those standard errors though - we just want the selection estimates - so we can go ahead and use the full dataset.
+
+Lastly, let's review the land-use classifications for our "used" locations to check what all is being shoved into the generic "non-forest" class.
+```{r explore-non-forest, warning=FALSE, message=FALSE}
+
+file.name <- paste0("../Project_data/tvRSF_sensitivity/time_varying_RSF_output_n", 100, "_q", 2, "_", "full", ".Rdata")
+temp <- get(load(file.name))
+
+hab.out_obs <- NULL
+hab.out_rand <- NULL
+for(j in 1:nrow(temp)){
+  td <- temp$rsf.cov.dat[[j]]
+  
+  th <- data.frame(matrix(table(td$lu[td$case_])/nrow(td[td$case_,]), nrow = 1))
+  colnames(th) <- paste("hab", names(table(td$lu)), sep = "_")
+  
+  th$id <- temp$id[j]
+  hab.out_obs <- rbind(hab.out_obs, th)
+  
+  
+  th <- data.frame(matrix(table(td$lu[!td$case_])/nrow(td[!td$case_,]), nrow = 1))
+  colnames(th) <- paste("hab", names(table(td$lu)), sep = "_")
+  
+  th$id <- temp$id[j]
+  hab.out_rand <- rbind(hab.out_rand, th)
+}
+
+
+
+mean.props <- apply(hab.out_obs[,1:(ncol(hab.out_obs)-1)], 2, mean)
+mean.props <- data.frame(habitat = names(mean.props),
+                         prop = mean.props)
+
+
+## re-class Wiscland2 land use classes according to this key
+lu.reclass.key <- data.frame(
+  wl.class = as.factor(cats(lu)[[1]]$VALUE),
+  wl.desc = cats(lu)[[1]]$CLS_DESC_2,
+  wl.hab = paste("hab", cats(lu)[[1]]$VALUE, sep = "_")
+)
+mean.props <- left_join(mean.props, lu.reclass.key, by = c("habitat" = "wl.hab"))
+mean.props <- mean.props[order(mean.props$prop, decreasing = T),]
+mean.props$habitat.f <- factor(mean.props$wl.desc, levels = mean.props$wl.desc)
+
+ggplot(mean.props, aes(x = habitat.f, y = prop, fill = habitat.f)) +
+  geom_bar(stat = "identity") +
+  ylab("Proportion of used locations") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 75, vjust = 1, hjust = 1), legend.position = "none", axis.title.x = element_blank())
+
+```
+
+
+
+
+### Conditional logistic regression for time-varying habitat selection 
+
+Just like with our movement metrics, we can use conditional logistic regression to determine if habitat selection is predictive of CWD status. We'll fit separate models for each month for the six months prior to case death. Our predictors will be daily average selection estimates for each habitat covariate for each individual, and we'll only include observations where both the case and matched control have data on the same day. This allows us to account for any seasonal variability contributing to changes in habitat selection.  
+
+Before we start, we'll clean up our R packages as we've been using many and some of them start to interfere with each other here. 
+
+```{r package-cleanup, results='hide', message=FALSE, warning=FALSE}
+library(pacman)
+pacman::p_unload(pacman::p_loaded(), character.only = TRUE) 
+
+## re-load necessary libraries ##
+library(adehabitatLT)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(amt)
+library(ggpubr)
+library(survival)
+library(TwoStepCLogit)
+library(GGally)
+```
+
+Next, we'll load our tvRSF data, calculate daily averages, and keep only those days where both case and matched control have data. 
+```{r paired-days}
+data <- get(load("../Project_data/case_control_collar_and_metadata.Rdata"))
+## case-control metadata
+meta <- data$meta.data
+
+rm(data)
+
+## time-varying RSF data
+iter.out <- get(load("../Project_data/tvRSF_sensitivity/time_varying_RSF_output_n100_q2_full.Rdata"))
+iter.out <- iter.out[!is.na(iter.out$rsf.out),]
+
+df <- iter.out %>% 
+  amt::select(id, pair.id, class, rsf.out) %>% unnest(cols = rsf.out)
+
+rm(iter.out)
+
+df <- df[!is.na(df$x_),]
+
+# order data by id and date
+df <- df %>% arrange(id, t_)
+
+
+# make sure id is a factor
+df$id <- as.factor(as.character(df$id))
+df$id <- factor(df$id)
+
+
+## add days pre-death
+ids <- unique(df$id)
+df.new <- NULL
+for(j in 1:length(ids)){
+  td <- df[df$id==ids[j],]
+  class <- unique(td$class)
+  
+  ## add "time pre-death" to tvRSF results
+  if(class=="case"){
+    tm <- meta[meta$cand.case==ids[j],]
+  }else{
+    tm <- meta[meta$lowtag==ids[j],]
+  }
+  
+  end.date <- as.Date(tm$case_mort.date, tz = "Canada/Saskatchewan")
+  
+  year <- format(max(td$t_, na.rm = T), "%Y")
+  end.day <- format(end.date, "%m-%d")
+  if(end.day=="02-29"){
+    end.day <- "02-28"
+  }
+  end.date <- as.Date(paste0(year, "-", end.day), tz = "Canada/Saskatchewan")
+  
+  td$t_day <- as.Date(td$t_, tz = "Canada/Saskatchewan")
+  td$time_pre_death_days <- as.numeric(difftime(end.date, td$t_day, units = "days"))
+  td$time_numeric <- 180-td$time_pre_death_days # "reverse" of "days pre-death" so 180 = death day
+  
+  if(any(na.omit(abs(td$time_pre_death))>190) | any(na.omit(td$time_pre_death)<(-1))){
+    stop("Days pre-death is wrong somewhere!")
+  }
+  
+  df.new <- rbind(df.new, td)
+}
+
+
+## means per day
+df_cov <- ddply(df.new, .(id, pair.id, class, time_pre_death_days), function(x) paste(unique(x$t_day)))
+df_wat <- ddply(df.new, .(id, pair.id, class, time_pre_death_days), function(x) mean(x$wat.dist_sc.x, na.rm = T))
+df_for <- ddply(df.new, .(id, pair.id, class, time_pre_death_days), function(x) mean(x$forest1, na.rm = T))
+df_fe <- ddply(df.new, .(id, pair.id, class, time_pre_death_days), function(x) mean(x$fe.dist_sc.x, na.rm = T))
+df_east <- ddply(df.new, .(id, pair.id, class, time_pre_death_days), function(x) mean(x$eastness.x, na.rm = T))
+df_north <- ddply(df.new, .(id, pair.id, class, time_pre_death_days), function(x) mean(x$northness.x, na.rm = T))
+
+colnames(df_cov)[colnames(df_cov)=="V1"] <- "day"
+df_cov$day <- as.Date(df_cov$day, tz = "Canada/Saskatchewan")
+colnames(df_wat)[colnames(df_wat)=="V1"] <- "wat.dist_sc_coef"
+colnames(df_for)[colnames(df_for)=="V1"] <- "forest1_coef"
+colnames(df_fe)[colnames(df_fe)=="V1"] <- "fe.dist_sc_coef"
+colnames(df_east)[colnames(df_east)=="V1"] <- "east_coef"
+colnames(df_north)[colnames(df_north)=="V1"] <- "north_coef"
+
+df_cov <- left_join(df_cov, df_wat, by = c("id", "pair.id", "class", "time_pre_death_days"))
+df_cov <- left_join(df_cov, df_for, by = c("id", "pair.id", "class", "time_pre_death_days"))
+df_cov <- left_join(df_cov, df_fe, by = c("id", "pair.id", "class", "time_pre_death_days"))
+df_cov <- left_join(df_cov, df_east, by = c("id", "pair.id", "class", "time_pre_death_days"))
+df_cov <- left_join(df_cov, df_north, by = c("id", "pair.id", "class", "time_pre_death_days"))
+
+
+## keep only days where case and matched control both have data
+matching.days <- function(temp){
+  counts <- ddply(temp, .(time_pre_death_days), nrow)
+  counts <- counts[counts$V1==2,]
+  temp <- temp[temp$time_pre_death_days %in% counts$time_pre_death_days,]
+  return(temp)
+}
+
+df_cov_matched <- NULL
+for(j in 1:length(unique(df_cov$pair.id))){
+  
+  temp.dat <- df_cov[df_cov$pair.id==unique(df_cov$pair.id)[j],]
+  temp.dat <- matching.days(temp.dat)
+  df_cov_matched <- rbind(df_cov_matched, temp.dat)
+}
+
+## optional checking
+# check <- ddply(df_cov_matched, .(id, time_pre_death_days), nrow)
+# table(check$V1) # should only have one observation per individual per day
+
+head(df_cov_matched)
+```
+
+
+
+Now we can do our final prep of our data for model fitting and check for any correlations between candidate predictors.
+
+```{r prep-data, message=FALSE, warning=FALSE}
+
+#### prep model data ####
+
+model.dat <- df_cov_matched
+  
+## add case/control status and reorder
+model.dat$case <- ifelse(model.dat$class=="case", TRUE, FALSE)
+model.dat <- model.dat[order(model.dat$pair.id, model.dat$day, model.dat$case),]
+model.dat$resp <- ifelse(model.dat$case, 1, 0)
+
+## add "month pre-case-death," based on days pre-case-death
+model.dat$mpd <- ceiling(model.dat$time_pre_death_days/30)
+model.dat$mpd[model.dat$mpd==0] <- 1
+
+
+
+
+
+#### test for correlations ####
+ggpairs(model.dat[,c("wat.dist_sc_coef", "forest1_coef", "fe.dist_sc_coef", "east_coef", "north_coef")], progress = F)
+
+
+
+```
+
+None of our predictors are correlated, and they're all on the same scale, so we don't need to fit univariate models or do scaling/centering here (as compared to the conditional logistic regressions using movement metrics).  
+
+Now we can fit our conditional logistic regressions for each of the six months prior to case death and plot the results. I'll just display one of these plots for demo purposes. 
+
+
+```{r mods-by-month}
+#### fit monthly models ####
+months.pre.death <- 1:6
+daily.models.by.month <- NULL
+
+
+for(i in 1:length(months.pre.death)){
+  # print(i)
+  temp.daily.dat <- model.dat[model.dat$mpd==months.pre.death[i],]
+  
+  cl.mod <- clogit(resp ~ wat.dist_sc_coef + forest1_coef + fe.dist_sc_coef + east_coef + north_coef +
+                     strata(day) + cluster(pair.id), data = temp.daily.dat, 
+                   model=TRUE,x=TRUE, y=TRUE,method = "efron")
+  pop.out <- as.data.frame(summary(cl.mod)$coefficients)
+  
+  
+  ### extract results ###
+
+  # pop.out$metric <- metrics[j]  
+  pop.out$mpd <- months.pre.death[i]
+  
+  daily.models.by.month <- rbind(daily.models.by.month, pop.out)
+}
+
+
+head(daily.models.by.month)
+# tail(daily.models.by.month)
+
+## add confidence intervals
+daily.models.by.month$upper <- daily.models.by.month$coef + (1.96*daily.models.by.month$`robust se`)
+daily.models.by.month$lower <- daily.models.by.month$coef - (1.96*daily.models.by.month$`robust se`)
+
+#### PLOT RESULTS ####
+
+#### forest edges ####
+fe.clr <- ggplot(daily.models.by.month[grepl("fe.dist", rownames(daily.models.by.month)),]) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkgrey") +
+  geom_errorbar(aes(x = mpd, ymin = lower, ymax = upper), width = 0.1) +
+  geom_point(aes(x = mpd, y = coef), size = 2) +
+  geom_path(aes(x = mpd, y = coef)) +
+  scale_x_continuous(trans = "reverse", breaks = seq(6, 1, by = -1), labels = seq(6, 1, by = -1)) +
+  xlab("Months prior to case death") + ylab("\u03B2: Selection for distance to forest edges") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12))
+# ggsave("../Figures/RSF_CLR_plots/fe_dist.jpeg", fe.clr, dpi = 300, width = 5, height = 3.5, units = "in")
+
+fe.clr
+
+
+#### water ####
+wat.clr <- ggplot(daily.models.by.month[grepl("wat.dist", rownames(daily.models.by.month)),]) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkgrey") +
+  geom_errorbar(aes(x = mpd, ymin = lower, ymax = upper), width = 0.1) +
+  geom_point(aes(x = mpd, y = coef), size = 2) +
+  geom_path(aes(x = mpd, y = coef)) +
+  scale_x_continuous(trans = "reverse", breaks = seq(6, 1, by = -1), labels = seq(6, 1, by = -1)) +
+  xlab("Months prior to case death") + ylab("\u03B2: Selection for distance to water") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12))
+# ggsave("../Figures/RSF_CLR_plots/water_dist.jpeg", wat.clr, dpi = 300, width = 5, height = 3.5, units = "in")
+
+
+#### forest ####
+for.clr <- ggplot(daily.models.by.month[grepl("forest1", rownames(daily.models.by.month)),]) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkgrey") +
+  geom_errorbar(aes(x = mpd, ymin = lower, ymax = upper), width = 0.1) +
+  geom_point(aes(x = mpd, y = coef), size = 2) +
+  geom_path(aes(x = mpd, y = coef)) +
+  scale_x_continuous(trans = "reverse", breaks = seq(6, 1, by = -1), labels = seq(6, 1, by = -1)) +
+  xlab("Months prior to case death") + ylab("\u03B2: Selection for forest") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12))
+# ggsave("../Figures/RSF_CLR_plots/forest.jpeg", for.clr, dpi = 300, width = 5, height = 3.5, units = "in")
+
+
+
+
+#### eastness ####
+east.clr <- ggplot(daily.models.by.month[grepl("east", rownames(daily.models.by.month)),]) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkgrey") +
+  geom_errorbar(aes(x = mpd, ymin = lower, ymax = upper), width = 0.1) +
+  geom_point(aes(x = mpd, y = coef), size = 2) +
+  geom_path(aes(x = mpd, y = coef)) +
+  scale_x_continuous(trans = "reverse", breaks = seq(6, 1, by = -1), labels = seq(6, 1, by = -1)) +
+  xlab("Months prior to case death") + ylab("\u03B2: Selection for easterly aspects") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12))
+# ggsave("../Figures/RSF_CLR_plots/eastness.jpeg", east.clr, dpi = 300, width = 5, height = 3.5, units = "in")
+
+
+#### northness ####
+north.clr <- ggplot(daily.models.by.month[grepl("north", rownames(daily.models.by.month)),]) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkgrey") +
+  geom_errorbar(aes(x = mpd, ymin = lower, ymax = upper), width = 0.1) +
+  geom_point(aes(x = mpd, y = coef), size = 2) +
+  geom_path(aes(x = mpd, y = coef)) +
+  scale_x_continuous(trans = "reverse", breaks = seq(6, 1, by = -1), labels = seq(6, 1, by = -1)) +
+  xlab("Months prior to case death") + ylab("\u03B2: Selection for northerly aspects") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12))
+# ggsave("../Figures/RSF_CLR_plots/northness.jpeg", north.clr, dpi = 300, width = 5, height = 3.5, units = "in")
+
+
+```
+
+
+Ultimately, habitat selection didn't seem to be a strong predictor of CWD status, though we did see some stronger preferences for proximity to forest edges among CWD cases in the two months just prior to death. 
+
+
+
+
+### Changepoint analysis for time-varying habitat selection
+
+With the output of our tvRSF modeling, we can now look for changepoints in selection: is there a point at which we observe a change in the relative selection for one or more of our habitat covariates? We'll model cases and controls separately, with a null model (no change) and a change model (stable selection, with a changepoint and then gradual change as death/end of trajectory approaches). If CWD causes a change in habitat selection, we'd expect to see a change in relative selection for cases, but not controls. However, if we do see a changepoint in controls, it may arise from normal seasonal variation - though we'd only expect this if our data largely comes from the same times of the year (spoiler: because a lot of case deaths occurred in winter/early spring, our data isn't evenly distributed across seasons).  
+
+For completing our changepoint analysis, we'll follow Barille et al 2024 (see link in Introduction), and use the *mcp* package to perform piecewise regression. Each model can be quite slow to run (the change models, in particular, can take hours to run), so I ran these with high throughput resources. The code is included below: 
+
+```{r cp-high-throughput, eval=FALSE}
+#!/usr/bin/env Rscript
+## HT_RSF_changepoint.R
+
+### Clear Environment ###
+remove(list=ls())
+
+#### load libraries ####
+library(plyr)
+library(dplyr)
+library(amt)
+library(tidyr)
+library(mcp)
+
+#### set index ####
+i <- as.numeric(commandArgs(TRUE[1])) + 1
+
+#### set MCMC run parameters ####
+adapt.n <- 22000
+iter.n <- 10000
+
+
+
+#### set seed ####
+set.seed(6541+i)
+
+#### load data ####
+
+## high-throughput runs
+runs <- expand.grid(covars=c("water", "forest", "fe.dist", "east", "north"),
+            mods = 0:1,
+            class = c("case", "control"),
+            prior = c(FALSE, TRUE)
+            )
+runs <- runs[!(runs$mods==0 & runs$prior),]
+
+
+
+
+
+data <- get(load("case_control_collar_and_metadata.Rdata"))
+## case-control metadata
+meta <- data$meta.data
+
+rm(data)
+
+## time-varying RSF data
+iter.out <- get(load("time_varying_RSF_output_n100_q2_full.Rdata"))
+iter.out <- iter.out[!is.na(iter.out$rsf.out),]
+
+df <- iter.out %>% 
+  amt::select(id, pair.id, class, rsf.out) %>% unnest(cols = rsf.out)
+
+rm(iter.out)
+
+df <- df[!is.na(df$x_),]
+
+# order data by id and date
+df <- df %>% arrange(id, t_)
+
+
+# make sure id is a factor
+df$id <- as.factor(as.character(df$id))
+df$id <- factor(df$id)
+
+
+## add days pre-death
+ids <- unique(df$id)
+df.new <- NULL
+for(j in 1:length(ids)){
+  td <- df[df$id==ids[j],]
+  class <- unique(td$class)
+  
+  ## add "time pre-death" to tvRSF results
+  if(class=="case"){
+    tm <- meta[meta$cand.case==ids[j],]
+  }else{
+    tm <- meta[meta$lowtag==ids[j],]
+  }
+  
+  end.date <- as.Date(tm$case_mort.date, tz = "Canada/Saskatchewan")
+  
+  year <- format(max(td$t_, na.rm = T), "%Y")
+  end.day <- format(end.date, "%m-%d")
+  if(end.day=="02-29"){
+    end.day <- "02-28"
+  }
+  end.date <- as.Date(paste0(year, "-", end.day), tz = "Canada/Saskatchewan")
+  
+  td$t_day <- as.Date(td$t_, tz = "Canada/Saskatchewan")
+  td$time_pre_death_days <- as.numeric(difftime(end.date, td$t_day, units = "days"))
+  td$time_numeric <- 180-td$time_pre_death_days # "reverse" of "days pre-death" so 180 = death day
+  
+  if(any(na.omit(abs(td$time_pre_death))>190) | any(na.omit(td$time_pre_death)<(-1))){
+    stop("Days pre-death is wrong somewhere!")
+  }
+  
+  df.new <- rbind(df.new, td)
+}
+
+
+## which covariate in this run?
+if(runs$covars[i]=="water"){
+  df_cov <- ddply(df.new, .(id, pair.id, class, time_numeric), function(x) mean(x$wat.dist_sc.x, na.rm = T))
+  prior <- list(cp_1 = "dnorm(120, 15) T(MINX, MAXX)")
+}else if(runs$covars[i]=="forest"){
+  df_cov <- ddply(df.new, .(id, pair.id, class, time_numeric), function(x) mean(x$forest1, na.rm = T))
+  prior <- list(cp_1 = "dnorm(90, 15) T(MINX, MAXX)")
+}else if(runs$covars[i]=="fe.dist"){
+  df_cov <- ddply(df.new, .(id, pair.id, class, time_numeric), function(x) mean(x$fe.dist_sc.x, na.rm = T))
+  prior <- list(cp_1 = "dnorm(120, 15) T(MINX, MAXX)")
+}else if(runs$covars[i]=="east"){
+  df_cov <- ddply(df.new, .(id, pair.id, class, time_numeric), function(x) mean(x$eastness.x, na.rm = T))
+  prior <- list(cp_1 = "dnorm(30, 15) T(MINX, MAXX)")
+}else if(runs$covars[i]=="north"){
+  df_cov <- ddply(df.new, .(id, pair.id, class, time_numeric), function(x) mean(x$northness.x, na.rm = T))
+  prior <- list(cp_1 = "dnorm(60, 15) T(MINX, MAXX)")
+}
+
+
+## keep only days where case and matched control both have data
+matching.days <- function(temp){
+  counts <- ddply(temp, .(time_numeric), nrow)
+  counts <- counts[counts$V1==2,]
+  temp <- temp[temp$time_numeric %in% counts$time_numeric,]
+  return(temp)
+}
+
+df_cov_matched <- NULL
+for(j in 1:length(unique(df_cov$pair.id))){
+  
+  temp.dat <- df_cov[df_cov$pair.id==unique(df_cov$pair.id)[j],]
+  temp.dat <- matching.days(temp.dat)
+  df_cov_matched <- rbind(df_cov_matched, temp.dat)
+}
+
+
+## case or control?
+df_mod <- df_cov_matched[df_cov_matched$class==runs$class[i],]
+
+
+
+
+# order dataframe
+dfg <- df_mod %>% arrange(id, time_numeric)
+
+
+
+# conduct mcp analysis 
+dfs <- dfg %>% 
+  dplyr::select(id, V1, time_numeric) %>% 
+  dplyr::rename(x=time_numeric, y= V1) %>% 
+  as.data.frame()
+# test our hypotheses
+
+
+if(!runs$prior[i]){
+  ## no prior ##
+  if(runs$mods[i]==0){
+    # no behavioral change
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0  # joined intercept, varying by id
+    )
+    fitm = mcp(modelf, data = dfs, par_x = "x", adapt = adapt.n, iter = iter.n)
+  }else if(runs$mods[i]==1){
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0 + x  # joined slope, varying by id
+    )
+    fitm = mcp::mcp(modelf, data = dfs, adapt = adapt.n, iter = iter.n)
+    
+  }
+}else{
+  ## set prior ##
+  if(runs$mods[i]==0){
+    # no behavioral change
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0  # joined intercept, varying by id
+    )
+    fitm = mcp(modelf, data = dfs, par_x = "x", prior = prior, adapt = adapt.n, iter = iter.n)
+  }else if(runs$mods[i]==1){
+    modelf = list(
+      y ~ 1,          # intercept flat
+      1 + (1|id) ~ 0 + x  # joined slope, varying by id
+    )
+    fitm = mcp::mcp(modelf, data = dfs, prior = prior, adapt = adapt.n, iter = iter.n)
+    
+  }
+}
+
+
+
+# Leveraging the power of loo::loo, we can see which model is preferred
+fitm$loo = loo(fitm)
+
+out.name <- paste0("RSFmcp_mod", runs$mods[i], "_", runs$covars[i], "_", runs$class[i], "_prior", runs$prior[i], ".Rdata")
+save(fitm, file = out.name)
+
+```
+
+Once the models are all run, we can compare null versus change models, as well as the top models for cases versus controls. In addition, we'll check things like posteriors and Rhats to evaluate fit and convergence for our models. 
+
+
+#### Proximity to water
+The model checking process was identical for the different habitat covariates, so we'll just look at one here: distance to water (this was a scaled and centered habitat covariate in the original time-varying RSFs). 
+```{r cp-water, message=FALSE}
+library(mcp) # re-load as unloaded earlier
+fit1_case <- get(load("../Project_data/RSFmcp_mods/RSFmcp_mod0_water_case_priorFALSE.Rdata")) 
+fit2_case <- get(load("../Project_data/RSFmcp_mods/RSFmcp_mod1_water_case_priorFALSE.Rdata"))
+fit3_case <- get(load("../Project_data/RSFmcp_mods/RSFmcp_mod1_water_case_priorTRUE.Rdata"))
+
+fit1_control <- get(load("../Project_data/RSFmcp_mods/RSFmcp_mod0_water_control_priorFALSE.Rdata"))
+fit2_control <- get(load("../Project_data/RSFmcp_mods/RSFmcp_mod1_water_control_priorFALSE.Rdata"))
+fit3_control <- get(load("../Project_data/RSFmcp_mods/RSFmcp_mod1_water_control_priorTRUE.Rdata"))
+
+loo::loo_compare(fit1_case$loo, fit2_case$loo, fit3_case$loo) 
+loo::loo_compare(fit1_control$loo, fit2_control$loo, fit3_control$loo) 
+```
+
+Let's look at posteriors for the cases and check our Rhats.
+```{r check-wat-cases}
+### cases ###
+fit1_case$loo
+fit2_case$loo
+fit3_case$loo
+
+# examine posterior fit of top model
+plot(fit1_case, q_fit = TRUE)
+plot(fit2_case, q_fit = TRUE)
+plot(fit3_case, q_fit = TRUE)
+
+#Gelman-Rubin convergence diagnostic (check Rhats)
+summary(fit1_case)
+summary(fit2_case)
+summary(fit3_case)
+
+# posterior predictive check
+pp_check(fit1_case)
+pp_check(fit2_case)
+pp_check(fit3_case)
+
+# change point posteriors
+plot_pars(fit1_case)
+plot_pars(fit2_case)
+plot_pars(fit3_case)
+
+```
+
+These results support "fit3" as our top model.  
+
+
+We'll repeat the same process for controls...
+```{r check-wat-controls}
+### controls ###
+fit1_control$loo
+fit2_control$loo
+fit3_control$loo
+
+# examine posterior fit of top model
+plot(fit1_control, q_fit = TRUE)
+plot(fit2_control, q_fit = TRUE)
+plot(fit3_control, q_fit = TRUE)
+
+#Gelman-Rubin convergence diagnostic (check Rhats)
+summary(fit1_control) 
+summary(fit2_control) 
+summary(fit3_control) 
+
+# posterior predictive check
+pp_check(fit1_control)
+pp_check(fit2_control)
+pp_check(fit3_control)
+
+# change point posteriors
+plot_pars(fit1_control)
+plot_pars(fit2_control)
+plot_pars(fit3_control)
+
+```
+
+  
+  
+These results support "fit1" (the null model) as our top model, given the poor convergence for the alternative models.  
+
+
+
+We can then save the top model for cases and controls for plotting later on.
+```{r top-wat-mods}
+# save models as objects for later plotting
+water_case <- fit3_case
+water_control <- fit1_control
+```
+
+
+
+#### Plots
+
+Once we have our top models, we can make some plots of our changepoint results. Again, these are all created the same way for the different habitat covariates, so we'll just look at water distance for demo purposes.  
+
+##### Water distance
+
+```{r wat-plot, warning=FALSE, message=FALSE}
+
+wat.a <- plot(water_case, geom_data = FALSE, q_fit = TRUE, nsamples = 2000)+
+  geom_hline(yintercept = 0, color = "gray", linetype = "dashed") +
+  coord_cartesian(ylim = c(-0.34, 0.33), expand = TRUE)+
+  scale_y_continuous(limits = c(-0.34, 0.33), breaks = seq(-0.2, 0.2, 0.2), labels =  seq(-0.2, 0.2, 0.2)) +
+  scale_x_continuous(breaks=c(0,30,60,90,120,150,181), limits=c(0,183), labels = c(6,5,4,3,2,1,"Death"))+
+  xlab("Months prior to case death") +
+  ylab("Selection for\ndistance to water") +
+  theme_bw() +
+  theme(#text = element_text(size = 18, family = "Times"), # controls all fonts in plot
+    panel.background = element_rect(colour = "black", linewidth=1, linetype = "solid"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.length = unit(0.2,"cm"),
+    axis.title.y = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black"),
+    axis.text.x = element_text(size = 12, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black")) +
+  theme(axis.title.x = element_text(margin = ggplot2::margin(t = 10)))+
+  theme(axis.title.y = element_text(margin = ggplot2::margin(r = 5)))+
+  theme(legend.position = "none")+
+  theme(legend.title = element_blank()) +
+  ggplot2::annotate("text", x = 90, y = 0.28, label = "CWD cases", size = 5, color = "black")
+
+wat.b <- plot(water_control, geom_data = FALSE, q_fit = TRUE, nsamples = 2000)+
+  geom_hline(yintercept = 0, color = "gray", linetype = "dashed") +
+   coord_cartesian(ylim = c(-0.34, 0.33), expand = TRUE)+
+  scale_y_continuous(limits = c(-0.34, 0.33), breaks = seq(-0.2, 0.2, 0.2), labels =  seq(-0.2, 0.2, 0.2)) +
+  scale_x_continuous(breaks=c(0,30,60,90,120,150,181), limits=c(0,183), labels = c(6,5,4,3,2,1,"Death"))+
+  xlab("Months prior to case death") +
+  ylab("Selection for\ndistance to water") +
+  theme_bw() +
+  theme(#text = element_text(size = 18, family = "Times"), # controls all fonts in plot
+    panel.background = element_rect(colour = "black", linewidth=1, linetype = "solid"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.length = unit(0.2,"cm"),
+    axis.title.y = element_blank(),
+    axis.title.x = element_text(size = 14, color = "black"),
+    axis.text.x = element_text(size = 12, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black")) +
+  theme(axis.title.x = element_text(margin = ggplot2::margin(t = 10)))+
+  theme(legend.position = "none")+
+  theme(legend.title = element_blank()) +
+  ggplot2::annotate("text", x = 90, y = 0.28, label = "Controls", size = 5, color = "black")
+
+
+wat.plot <- ggarrange(wat.a, wat.b, labels = c("A", "B"), nrow = 1)
+wat.plot
+
+```
+
+### Closing
+
+In closing, if you read this far, bravo! Let's re-load those packages from the very beginning and then I'll give my session info for reproducibility:
+
+```{r re-load-packages, results='hide', message=FALSE, warning=FALSE}
+#### load libraries ####
+library(raster)
+library(adehabitatHR)
+library(plyr)
+library(dplyr)
+library(amt)
+library(tidyr)
+library(dynamichazard)
+library(ggplot2)
+library(sf)
+library(terra)
+library(ctmm)
+library(move)
+library(foreach)
+library(doParallel)
+library(doSNOW)
+library(ggpubr)
+library(lubridate)
+library(mcp) 
+library(RColorBrewer)
+library(GGally)
+```
+
+Session info:
+```{r session-info}
+sessionInfo()
+```

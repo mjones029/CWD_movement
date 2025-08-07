@@ -15,7 +15,7 @@ Once downloaded, just click on the downloaded file and the HTML should appear in
 1. Simulation-based approach for matching case-control pairs: **Case_control_pairing**  
 2. Conditional logistic regressions for movement metrics: **Conditional_logReg**  
 3. Changepoint analysis of movement metrics: **Movement_cp**  
-4. 
+4. Estimation of time-varying habitat selection, with conditional logistic regression and changepoint analysis: **tvRSF**  
 
 
 ### What's not included in this respository:
