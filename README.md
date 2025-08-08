@@ -16,6 +16,8 @@ Once downloaded, just click on the downloaded file and the HTML should appear in
 2. Conditional logistic regressions for movement metrics: **Conditional_logReg**  
 3. Changepoint analysis of movement metrics: **Movement_cp**  
 4. Estimation of time-varying habitat selection, with conditional logistic regression and changepoint analysis: **tvRSF**  
+5. Detection of extra-home range excursions and analysis of excursion durations: **Excursions**  
+
 
 
 ### What's not included in this respository:

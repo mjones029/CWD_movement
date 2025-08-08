@@ -1,0 +1,981 @@
+---
+title: "Excursions"
+author: "Marie Gilbertson"
+date: "2025-08-07"
+knit: (function(inputFile, encoding) {
+      out_dir <- "../Markdown_reports";
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_dir=file.path(dirname(inputFile), out_dir))})
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this report, I demo the process we used to:  
+
+1. Identify extra-home-range movements (excursions) of white-tailed deer  
+
+2. Fit survival models to determine if excursion durations vary between chronic wasting disease (CWD) cases and controls  
+
+In the interest of keeping this report focused on novel or lesser-used methods, linear and logistic regressions are not included; these methods are common and our code is not unique. 
+
+For data ownership reasons, the data is not publicly available. However, I will preview the data structure so others can adapt this approach for themselves. Readers interested in data access should contact Daniel Storm at the Wisconsin Department of Natural Resources.
+
+We'll start by loading the packages we'll need, as well as a couple of custom functions for later use. I also always set my seed as standard practice (this makes randomization reproducible).
+
+```{r load-libraries, results='hide', message=FALSE, warning=FALSE}
+
+#### Clear Environment ####
+remove(list=ls())
+
+
+#### set seed ####
+set.seed(89462)
+
+
+#### load libraries ####
+library(adehabitatLT)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(amt)
+library(ggpubr)
+library(ctmm)
+library(move)
+library(sf)
+library(units)
+library(anomalize)
+library(RColorBrewer)
+library(MetBrewer)
+library(lme4)
+library(pscl)
+library(MASS)
+library(boot)
+library(lmerTest)
+library(sjPlot)
+library(GGally)
+library(arm)
+library(DHARMa)
+library(icenReg)
+library(interval)
+
+#### load custom functions ####
+
+## function for numbering unique excursion events
+number.events <- function(cand.ex){
+  cand.ex$ex.event <- 0
+  
+  
+  # if first location is an anomaly (should not be, but let's be safe)
+  if(cand.ex$anomaly[1]=="Yes"){
+    event.num <- 1
+  }else if(cand.ex$anomaly[1]=="No"){
+    event.num <- 0
+  }
+  cand.ex$ex.event[1] <- event.num
+  
+  for(j in 2:nrow(cand.ex)){
+    
+    # if this row isn't an anomaly, skip
+    if(cand.ex$anomaly[j]=="No") next
+    
+    
+    # if it is an anomaly, proceed with numbering
+    if(cand.ex$anomaly[j]=="Yes"){
+      
+      # if an anomaly, was the preceeding row an anomaly? If not, this is a new event and gets a new number; otherwise, we keep the old number
+      if(cand.ex$anomaly[j-1]=="No"){
+        event.num <- event.num + 1
+      }
+      
+      cand.ex$ex.event[j] <- event.num
+      
+    }
+    
+  }
+  
+  return(cand.ex)
+}
+
+
+## function for calculating the distance between two points
+euc.dist <- function(x1, y1, x2, y2){
+  out <- sqrt(((y2-y1)^2) + ((x2-x1)^2))
+  return(out)
+}
+
+```
+
+
+
+
+### Load data
+
+Let's load and preview the movement data for CWD cases and controls. The movement data is in "point" format. Net-squared displacement values were generated using the adehabitatLT package (movement data was made into an "ltraj" object, and then converted back to a dataframe). The column "R2n" gives each point's net-squared displacement value.  
+
+We'll also load previously calculated data documenting the monthly range centroid for each individual. This will be used to calculate the distance of excursion events. 
+
+```{r load-data}
+## load movement data
+coll <- get(load("../Project_data/excursion_movement_data.Rdata"))
+str(coll)
+
+## load metadata
+data <- get(load("../Project_data/case_control_collar_and_metadata.Rdata"))
+## case-control metadata
+meta <- data$meta.data
+
+## load monthly range centroids for all individuals
+cent.dat <- get(load("../Project_data/monthly_od_centroids.Rdata"))
+str(cent.dat)
+```
+
+
+
+### Identify candidate excursions
+
+To identify candidate excursions, we'll use each individual's net-squared displacement. Specifically, we'll look for "anomalous" spikes in net-squared displacement, as these can indicate that an individual has left their normal range. Movement data can be messy and we have variable fix rates between individuals, so I chose to use the daily mean net-squared displacement (NSD) for each individual. This means I was "smoothing" over some of the variation in NSD, which should reduce the number of "false positive" excursion detections. 
+
+We'll start out by looking at a single example of using anomaly detection with NSD. I'll show both "raw" NSD and daily averaged NSD.
+```{r nsd-ex}
+# extract movement data for the example individual
+temp.coll <- collm[collm$id==7850,]
+temp.coll <- temp.coll[order(temp.coll$date),] # make sure it's in order
+temp.coll$pt.index <- paste(temp.coll$id, seq(1, nrow(temp.coll)), sep = "_") # assign a unique index number to each point location
+
+## plot the movement data for this individual
+ggplot(temp.coll, aes(x = x, y = y)) +
+  geom_path() +
+  coord_fixed() + theme_bw() + ggtitle("Lowtag 7850 movement")
+
+
+### raw net-squared displacement over time
+ggplot(temp.coll, aes(x = date, y = R2n)) + 
+  geom_path() + 
+  theme_bw() + ggtitle("Raw net-squared displacement over time")
+
+### daily-averaged NSD
+# calculate daily mean NSD for the i'th individual
+daily.nsd <- ddply(temp.coll, .(odays), function(x) mean(x$R2n))
+t <- tibble(daily.nsd) # convert to a tibble for anomaly detection
+
+ggplot(daily.nsd, aes(x = odays, y = V1)) +
+  geom_path() + xlab("Year-less day") + ylab("NSD") +
+  theme_bw() + ggtitle("Daily averaged net-squared displacement")
+```
+
+
+Let's look at anomaly detection for the raw and averaged NSD values.
+
+```{r excursion-detection-ex}
+#### detect anomalies among raw NSD ####
+q <- tibble(temp.coll)
+t_ano <- data.frame(matrix(nrow = 0, ncol = 1))
+suppressMessages(t_ano <- q %>%
+  time_decompose(R2n, merge = T) %>%
+  anomalize(remainder) %>%
+  time_recompose()
+)
+
+t_ano %>% plot_anomalies(ncol = 3, alpha_dots = 0.75) + ggtitle("Raw NSD anomalies")
+
+#### detect anomalies among daily mean NSD ####
+## use anomalize package for anomaly detection of NSD
+t_ano <- data.frame(matrix(nrow = 0, ncol = 1))
+suppressMessages(t_ano <- t %>%
+  time_decompose(V1, merge = T) %>%
+  anomalize(remainder) %>%
+  time_recompose()
+)
+
+t_ano %>% plot_anomalies(ncol = 3, alpha_dots = 0.75) + ggtitle("Daily averaged NSD anomalies")
+
+
+```
+
+We can see that the anomaly detection picks up the movements where lowtag 7850 moved well outside its normal home range, but there can be a lot of "noise" in these detections. Using the daily-averaged NSD values seems to reduce some of the noise, while keeping the clearer excursion examples. We'll use this method now in a loop to look for and extract data about anomalous NSD events for all our individuals.  
+
+
+
+
+```{r excursion-id-loop}
+ids <- unique(collm$id) # loop through each individual
+excursions.dat <- NULL  # to store the movement data associated with excursions
+exc.dist.dat <- NULL    # to store meta-data associated with each excursion (namely, the distance of the excursion)
+
+for(i in 1:length(ids)){
+  
+  # extract movement data for the i'th individual
+  temp.coll <- collm[collm$id==ids[i],]
+  temp.coll <- temp.coll[order(temp.coll$date),] # make sure it's in order
+  temp.coll$pt.index <- paste(temp.coll$id, seq(1, nrow(temp.coll)), sep = "_") # assign a unique index number to each point location
+
+
+  
+  #### detect anomalies among daily mean NSD ####
+
+  # calculate daily mean NSD for the i'th individual
+  daily.nsd <- ddply(temp.coll, .(odays), function(x) mean(x$R2n))
+  t <- tibble(daily.nsd) # convert to a tibble for anomaly detection
+  
+  ## try anomaly detection; if the time series is short, will make plot of movement and skip to next individual
+  t_ano <- data.frame(matrix(nrow = 0, ncol = 1))
+  try(suppressMessages(t_ano <- t %>%
+    time_decompose(V1, merge = T) %>%
+    anomalize(remainder) %>%
+    time_recompose()),
+    silent = T
+  )
+
+  if(nrow(t_ano)==0){
+    p <- ggplot() +
+      geom_path(data = temp.coll, aes(x = x, y = y)) +
+      coord_fixed() +
+      theme_bw()
+    
+    
+    # plot.name <- paste0("Figures/Excursions/", ids[i], "/excursionplot_", ids[i], "_event_0.jpeg")
+    # suppressMessages(ggsave(plot.name, p, width = 7, height = 7, dpi = 300))
+    
+    # save back NA's for anomaly data if not enough movement data to evaluate
+    temp.dists <- data.frame(id = ids[i],
+                             event = 0,
+                             mpd = NA,
+                             max.dist_m = NA)
+    exc.dist.dat <- rbind(exc.dist.dat, temp.dists)
+    
+    next # skip to next individual
+  }
+  
+  ## if an anomalies were detected, link the movement data with the anomaly data by day
+  ano.data <- left_join(temp.coll, t_ano[,c("odays", "anomaly")], by = "odays")
+  
+  
+  
+  #### number anomaly events ####
+  ano.data.num <- number.events(ano.data) # each unique anomaly gets a unique identifier
+  
+  
+  
+  ## if at least one anomaly exists, get it's max distance ##
+  #### max distance to monthly range center per event ####
+  ## use the monthly range center from the month in which the excursion started
+  if(max(unique(ano.data.num$ex.event))>0){
+    temp.dists <- NULL
+    events <- unique(ano.data.num$ex.event)
+    events <- events[events!=0]
+    
+    for(j in 1:length(events)){ # loop through unique anomaly events
+
+      temp.dat <- ano.data.num[ano.data.num$ex.event==events[j],]
+      
+      # centroid for the earliest month associated with an ecxursion (i.e., when the excursion started)
+      temp.month <- max(temp.dat$mpd)
+      temp.cent <- cent.dat[cent.dat$id==ids[i] & cent.dat$mpd==temp.month,] 
+      # distance between centroid and the points associated with the excursion/anomaly event
+      temp.dat$cent.dist <- NA
+      for(k in 1:nrow(temp.dat)){
+        temp.dat$cent.dist[k] <- euc.dist(x1 = temp.cent$x, y1 = temp.cent$y,
+                                          x2 = temp.dat$x[k], y2 = temp.dat$y[k])
+      }
+      # save back only the maximum distance
+      td <- data.frame(id = ids[i],
+                       event = events[j],
+                       mpd = temp.month,
+                       max.dist_m = max(temp.dat$cent.dist))
+      
+      temp.dists <- rbind(temp.dists, td)
+      
+      ## make and save a plot showing the movement data, the unique excursion, and the points used to calculate the max excursion distance
+      p <- ggplot() +
+        geom_path(data = ano.data.num, aes(x = x, y = y)) +
+        geom_path(data = temp.dat, aes(x = x, y = y), colour = "red") +
+        geom_point(data = temp.dat, aes(x = x, y = y), colour = "red") +
+        geom_point(data = temp.dat[temp.dat$cent.dist==max(temp.dat$cent.dist),], aes(x = x, y = y), fill = "gold", size = 4, pch = 23) +
+        geom_point(data = temp.cent, aes(x = x, y = y), fill = "dodgerblue2", size = 4, pch = 22) + 
+        coord_fixed() +
+        theme_bw()
+      
+      
+      # plot.name <- paste0("../Figures/Excursions/", ids[i], "/excursionplot_", ids[i], "_event_", events[j], ".jpeg")
+      # suppressMessages(ggsave(plot.name, p, width = 7, height = 7, dpi = 300))
+      
+    }
+  
+    # save completed distance data if there is at least one anomaly
+    exc.dist.dat <- rbind(exc.dist.dat, temp.dists) 
+  }else{
+    
+    # if there was enough data to look for excursions but none were detected, save back a plot of the movement data
+    p <- ggplot() +
+      geom_path(data = ano.data.num, aes(x = x, y = y)) +
+      coord_fixed() +
+      theme_bw()
+    
+    
+    # plot.name <- paste0("../Figures/Excursions/", ids[i], "/excursionplot_", ids[i], "_event_0.jpeg")
+    # suppressMessages(ggsave(plot.name, p, width = 7, height = 7, dpi = 300))
+  }
+      
+  # save back excursion data, regardless of number of anomalies/excursions
+  excursions.dat <- rbind(excursions.dat, ano.data.num)
+
+  
+}
+
+## add case/control info to the candidate excursion metadata
+exc.dist.dat$class <- ifelse(exc.dist.dat$id %in% meta$cand.case, "case", "control")
+
+
+## when running, don't forget to save!
+excursions.out <- list(excursions.dat, exc.dist.dat)
+names(excursions.out) <- c("excursions.dat", "exc.dist.dat")
+# save(excursions.out, file = "../Project_data/excursions_out.Rdata") 
+
+str(excursions.dat)
+str(exc.dist.dat)
+```
+
+We've now identified candidate excursions for all our individuals. However, these are just "candidate" events, and require additional processing.  
+
+
+### Exclude months with dispersals
+
+When detecting excursions, it's important to exclude dispersal events as these are fundamentally different from excursions. In addition, depending on the research question, you may want to exclude some amount of time pre- and even post-dispersal, as individuals may be more likely to make excursions in "preparation" for dispersal. I'm skipping over the code process of excluding dispersals here because it's just a lot of data wrangling code based on dispersal data from a [previous dispersal study](https://link.springer.com/article/10.1186/s40462-022-00342-5) we did, and nothing novel - but noting it as an important step in the overall process.
+
+```{r disp-date-wrangling, include=FALSE}
+## load dispersal data from dispersal study
+disps <- get(load("../Project_data/timeout2_inprogress.Rdata"))
+head(disps)
+
+## Loads a file that contains two dataframes in list format
+data <- get(load("../Project_data/case_control_collar_and_metadata.Rdata"))
+## point-format movement data (only used for linking dispersal and excursion data)
+coll_orig <- data$collar.data 
+
+#### make pair ID key ####
+meta$pair.id <- as.character(seq(1, nrow(meta)))
+pair.key <- meta[,c("lowtag", "pair.id")]
+pair.key2 <- meta[,c("cand.case", "pair.id")]
+colnames(pair.key) <- c("id", "pair.id")
+colnames(pair.key2) <- c("id", "pair.id")
+pair.key <- rbind(pair.key, pair.key2)
+
+
+## keep only the dispersal data for individuals in this CWD & movement study
+disps <- disps[disps$lowtag %in% collm$id,]
+
+
+#### un-year movement data for linking between dispersal and movement ####
+## we'll "un-year" the full collar data for this study so we have a "key" for the original days and the un-yeared days 
+# (rather than the resampled set, which no longer has the "original" time stamps)
+oday.colls <- NULL
+ids <- unique(coll_orig$id) 
+for(i in 1:length(ids)){
+  temp <- coll_orig[coll_orig$id==ids[i],]
+  oday <- temp$day[nrow(temp)] # the final day
+  oday <- as.Date(paste0("2015", format(oday, "-%m-%d")), tz = "America/Chicago") # make the final day be in 2015
+  tdiffs <- difftime(temp$day, temp$day[nrow(temp)], units = "days")              # all days relative to that final day
+  temp$odays <- oday + tdiffs                                                     # can end up ever so slightly off because of leap days
+  
+  oday.colls <- rbind(oday.colls, temp)
+}
+
+#### add months prior to death ####
+oday.colls <- left_join(oday.colls, pair.key, by = "id")
+pair.ids <- unique(pair.key$pair.id)
+oday.colls$dpd <- NA # days pre-death
+oday.colls$mpd <- NA # months pre-death
+
+## months prior to death will be relative to the day of case death for each pair
+oday.m <- NULL
+for(i in 1:length(unique(pair.ids))){
+  temp.coll <- oday.colls[oday.colls$pair.id==pair.ids[i],]
+  
+  ## establish case death date in "oday" years
+  max.coll.date <- max(temp.coll$odays[temp.coll$class=="case"])
+  case.id <- unique(temp.coll$id[temp.coll$class=="case"])
+  case.death.date <- as.Date(meta$case_mort.date[meta$cand.case==case.id], tz = "America/Chicago")
+  oyear <- format(max.coll.date, "%Y")
+  oday <- format(case.death.date, "-%m-%d")
+  if(oday=="-02-29"){
+    oday <- "-02-28"
+  }
+  final.date <- as.Date(paste0(oyear, oday), tz = "America/Chicago")
+  
+  temp.coll$dpd <- difftime(final.date, temp.coll$odays, units = "days")
+  if(any(temp.coll$dpd<0)){
+    stop("Zombie deer!")
+  }
+  
+  temp.coll$mpd <- ceiling(as.numeric(temp.coll$dpd)/30)
+  temp.coll$mpd[temp.coll$mpd==0] <- 1 # observations on death day can just become within "month 1" pre-death
+  temp.coll <- temp.coll[temp.coll$mpd<7,]
+  
+  oday.m <- rbind(oday.m, temp.coll)
+  
+}
+
+
+#### now link to dispersal dates ####
+disps$mpd <- NA
+
+for(i in 1:nrow(disps)){
+  
+  temp.disp <- disps[i,]
+  temp.coll <- oday.m[oday.m$id==temp.disp$lowtag,]
+  
+  if(temp.disp$d1<min(temp.coll$date)) next # if dispersal occurred more than 6 months prior to case death, skip
+  
+  temp.coll$disp.diff <- abs(as.numeric(difftime(temp.coll$date, temp.disp$d1, units = "days")))  # collar location closest to the dispersal start
+  min.diff <- temp.coll[temp.coll$disp.diff==min(temp.coll$disp.diff),]
+  if(length(unique(min.diff$mpd))>1){
+    stop("Minimum difference crosses months")
+  }
+  disps$mpd[i] <- unique(min.diff$mpd) # months pre-case-death of the dispersal event
+  
+  
+}
+
+
+## NA's mean that the dispersal event did not occur during the study period (i.e., the 6 months of collar data we're using for that individual)
+disps <- disps[!is.na(disps$mpd),]
+
+excursions.dat$idm.index <- paste(excursions.dat$id, excursions.dat$mpd, sep = "_") # index of ID and month for excursion movement data
+exc.dist.dat$idm.index <- paste(exc.dist.dat$id, exc.dist.dat$mpd, sep = "_")       # index of ID and month for excursion meta-data
+disps$idm.index <- paste(disps$lowtag, disps$mpd, sep = "_")                        # index of ID and month for dispersal data
+
+## Add column for binary "is this observation in a month in which dispersal occurred" (TRUE or FALSE)
+excursions.dat$disp.month <- ifelse(excursions.dat$idm.index %in% disps$idm.index, TRUE, FALSE)
+exc.dist.dat$disp.month <- ifelse(exc.dist.dat$idm.index %in% disps$idm.index, TRUE, FALSE)
+
+## candidate excursions that are or are not in a dispersal month
+table(exc.dist.dat$disp.month)
+
+## create versions of excursion datasets where dispersal months are excluded
+excursions.dat.nd <- excursions.dat[!excursions.dat$disp.month,]
+exc.dist.dat.nd <- exc.dist.dat[!exc.dist.dat$disp.month,]
+
+## all candidate excursions get unique IDs
+excursions.dat.nd$evtid <- paste(excursions.dat.nd$id, excursions.dat.nd$ex.event, sep = "_")
+
+## save dispersal data for other analyses
+disps$disp.in.study <- ifelse(disps$lowtag %in% exc.dist.dat$id[exc.dist.dat$disp.month], "disp.in.study", "no.disp")
+save(disps, file = "../Project_data/processed_dispersal_dat.Rdata")
+
+```
+
+
+### Screen candidate excursions
+
+We've automated identification of candidate excursions, but as we'll see, many of these are not what we would consider true or likely excursions. Of course, we can't ever truly tell what's a real excursion and what's, say, data error. As such, screening candidate excursions will inevitably be a bit subjective.  
+
+From a CWD perspective, I would argue that we are most concerned with long distance and long duration excursions. Long distance excursions can spread CWD to unexpected areas, relative to the extent of a deer's normal home range. Long duration excursions provide more opportunity for an infectious individual to transmit to others or shed prions into the environment. Longer distance and longer duration excursions should be more "obvious" when looking at a map of an individual's locations, with points being far from the main range and/or multiple consecutive relocations occurring outside the main range.
+
+With these considerations in mind, I want to focus my analysis on these more obvious excursion events. Yes, I may miss some excursion events - especially those that are short distance or short duration (i.e., reduced sensitivity in excursion detection) - but because these are arguably less relevant for CWD transmission, I consider this an acceptable compromise. Especially because, as I'll show below, we have a lot of "false positive" excursions and I don't want to bias subsequent analysis with these excursions. In other words, I'm prioritizing specificity in excursion detection over sensitivity. 
+
+Let's look at examples of candidate excursions that are likely "false detections", real excursions, and ambiguous. Here's a plot of the movement data for deer number 7850. 
+
+```{r example-7850}
+## "excursions.dat.nd" is the same as "excursions.dat" in structure - it just has disersal events removed (nd = no dispersals)
+temp.exc.dat <- excursions.dat.nd[excursions.dat.nd$id==7850,]
+
+ggplot() + 
+  geom_path(data = temp.exc.dat, aes(x = x, y = y)) + 
+  coord_fixed() +
+  theme_bw()
+```
+
+We can see that this individual had a "core range" with a lot of movements to the southeast and some less frequent movements to the north. The anomaly detection program identified 9 candidate excursions from this movement data, but let's look a little closer at some of these. This time, we'll plot just the first candidate excursion and we'll add the home range centroid for the month in which this candidate excursion occurred.
+
+```{r example-bad, message=FALSE}
+
+temp.exc1 <- excursions.dat.nd[excursions.dat.nd$id==7850 & excursions.dat.nd$ex.event==1,]
+
+temp.cent <- cent.dat[cent.dat$id==7850 & cent.dat$mpd==min(temp.exc1$mpd),]
+  
+ggplot() + 
+  geom_path(data = temp.exc.dat, aes(x = x, y = y)) + 
+  geom_path(data = temp.exc1, aes(x = x, y = y), colour = "red") +
+  geom_point(data = temp.exc1, aes(x = x, y = y), colour = "red", size = 2) +
+  geom_point(data = temp.cent, aes(x = x, y = y), fill = "dodgerblue2", size = 4, pch = 22) +
+  coord_fixed() +
+  theme_bw()
+
+        
+```
+  
+The red dot is the single location associated with this candidate excursion, and the blue square is the home range centroid for that month. While the candidate excursion falls outside the "normal core range," this is a short duration event to a location this individual apparently frequents. As such, I would not consider this a true excursion.  
+
+Let's look at the 7th candidate excursion for this individual.
+
+```{r example-good}
+temp.exc1 <- excursions.dat.nd[excursions.dat.nd$id==7850 & excursions.dat.nd$ex.event==7,]
+
+temp.cent <- cent.dat[cent.dat$id==7850 & cent.dat$mpd==min(temp.exc1$mpd),]
+  
+ggplot() + 
+  geom_path(data = temp.exc.dat, aes(x = x, y = y)) + 
+  geom_path(data = temp.exc1, aes(x = x, y = y), colour = "red") +
+  geom_point(data = temp.exc1, aes(x = x, y = y), colour = "red", size = 2) +
+  geom_point(data = temp.cent, aes(x = x, y = y), fill = "dodgerblue2", size = 4, pch = 22) +
+  coord_fixed() +
+  theme_bw()
+
+  
+
+```
+
+Here, we see a longer duration and distance candidate excursion than the previous one we examined. In addition, this excursion is to a novel or otherwise uncommonly visited area. I would consider this a true excursion.  
+
+Of course, not all candidate excursions are particularly clear. Let's look at another candidate excursion for this individual.
+
+```{r example-ambiguous}
+temp.exc1 <- excursions.dat.nd[excursions.dat.nd$id==7850 & excursions.dat.nd$ex.event==8,]
+
+temp.cent <- cent.dat[cent.dat$id==7850 & cent.dat$mpd==min(temp.exc1$mpd),]
+  
+ggplot() + 
+  geom_path(data = temp.exc.dat, aes(x = x, y = y)) + 
+  geom_path(data = temp.exc1, aes(x = x, y = y), colour = "red") +
+  geom_point(data = temp.exc1, aes(x = x, y = y), colour = "red", size = 2) +
+  geom_point(data = temp.cent, aes(x = x, y = y), fill = "dodgerblue2", size = 4, pch = 22) +
+  coord_fixed() +
+  theme_bw()
+
+  
+
+```
+
+This event is similar to the previous one, but this deer does revisit this area on several occasions. Is this a real excursion? I'm not sure we can say. I would classify this event as "ambiguous."  
+
+These are just a few examples from a single individual, but I used these same basic principles to screen all candidate excursions. I've included the code below, but this process was ultimately a subjective review of each candidate excursion in which I classified each event as a likely excursion ("ok"), a likely false excursion ("bad"), or "ambiguous." In addition, there wasn't perfect overlap between individuals included in this study and those included in the original dispersal study, so I also screened for evidence of dispersal events. 
+
+```{r screening-code, eval=FALSE}
+
+## all candidate excursions have a unique identifier (we'll loop through these)
+evtids <- unique(excursions.dat.nd$evtid[excursions.dat.nd$ex.event!=0])
+i <- 1
+exc.screen <- data.frame(evtids = evtids,
+                         id = NA,
+                         mpd = NA,
+                         screen.result = NA)
+
+
+repeat{
+  
+  ## extract data for the candidate excursion
+  temp.exc.dat <- excursions.dat.nd[excursions.dat.nd$evtid==evtids[i],]
+  temp.id <- unique(temp.exc.dat$id)
+  if(length(temp.id)>1){
+    stop("Multiple individuals")
+  }
+  
+  temp.dat <- excursions.dat.nd[excursions.dat.nd$id==temp.id,]
+  
+  temp.cent <- cent.dat[cent.dat$id==temp.id & cent.dat$mpd==min(temp.exc.dat$mpd),]
+  
+  
+  ## print plot of this candidate excursion in the context of the individual's movement data
+  suppressMessages(
+  print(ggplot() + 
+          geom_path(data = temp.dat, aes(x = x, y = y)) + 
+          geom_path(data = temp.exc.dat, aes(x = x, y = y), colour = "red") +
+          geom_point(data = temp.exc.dat, aes(x = x, y = y), colour = "red", size = 2) +
+          geom_point(data = temp.cent, aes(x = x, y = y), fill = "dodgerblue2", size = 4, pch = 22) +
+          coord_fixed() +
+          theme_bw()
+        
+        ))
+  
+  ## user prompted to provide a classification decision
+  # ok = likely excursion
+  # disp = likely dispersal event
+  # bad = unlikely to be a real excursion
+  # ambig = ambiguous; can't determine if excursion or not
+  repeat{
+    raw <- readline("Real excursion? Choices are: ok, disp, bad, ambig  ")
+    
+    if(raw %in% c("ok", "disp", "bad", "ambig"))break
+    
+    if(!raw %in% c("ok", "disp", "bad", "ambig")){
+      print("Let's try that again...")
+    }
+  }
+    
+    
+    exc.screen$id[i] <- temp.id
+    exc.screen$mpd[i] <- min(temp.exc.dat$mpd)
+    exc.screen$screen.result[i] <- raw
+    
+
+    ## user is prompted to input if they have changed their mind about this classification (e.g., in case of a mistype or too quick decision)
+    regrets <- readline("Having regrets about that last one? Choices are: y or n  ")
+
+    
+    if(regrets=="n"){
+      i <- i +1
+    }else{
+      "Ok, let's repeat that last one..."
+    }
+    
+    if(i>length(evtids)) break
+    if(i%%10==0){
+      print(paste0("Progress: ", round((i/length(evtids))*100, 1), "%"))
+    }
+}
+
+## save screening results
+# save(exc.screen, file = "../Project_data/Excursions_screening_rawout.Rdata")
+```
+
+
+All screening choices were saved so there is a record of each decision. Let's take a look at these screening results.
+
+```{r screen-results}
+exc.screen <- get(load("../Project_data/Excursions_screening_rawout.Rdata"))
+
+head(exc.screen)
+table(exc.screen$screen.result)
+
+```
+
+We can see that a LOT of candidate excursions are pretty unequivocally "bad" but many of them do seem reasonable. In addition, while there are plenty ambiguous candidate events, it was generally pretty straightforward to make a call between excursion or not.  
+
+
+### Explore excursions
+
+Now that we've screened our excursions, let's take a look at the metadata for the ok and ambiguous excursion events. From our previous [habitat selection study](https://wildlife.onlinelibrary.wiley.com/doi/full/10.1002/wmon.70001), we know that the average seasonal range size is about 1.07 km^2; the diameter of a circle of that area would be about 660m. We can plot excursion distances relative to this "typical range diameter."
+
+```{r ok-ambig}
+## only the ok or ambiguous ones
+ok.ambig <- exc.screen[exc.screen$screen.result %in% c("ok", "ambig"),]
+excursions.dat.nd.scrn <- excursions.dat.nd[excursions.dat.nd$evtid %in% ok.ambig$evtids,]
+exc.dist.dat.nd$evtid <- paste(exc.dist.dat.nd$id, exc.dist.dat.nd$event, sep = "_")
+exc.dist.dat.nd.scrn <- exc.dist.dat.nd[exc.dist.dat.nd$evtid %in% ok.ambig$evtids,]
+
+exc.oa <- left_join(exc.dist.dat.nd.scrn, exc.screen[,c("evtids", "screen.result")], by = c("evtid" = "evtids"))
+
+ggplot(exc.oa, aes(x = max.dist_m, fill = screen.result)) +
+  geom_histogram(binwidth = 500, colour = "white") +
+  geom_vline(xintercept = 660, colour = "red", linetype = "dashed") +
+  theme_bw()
+```
+
+
+We can see that ambiguous events are generally pretty short distance - which makes sense, given that we'll feel more confident in an excursion if it's long distance and/or long duration. In addition, we can see that excursion distances are skewed.  
+
+#### Excursion rates
+
+From here on, let's just focus on the excursions that we're the most confident in. We'll next look at the frequency of excursions, including calculating an excursion "rate," where we divide the number of excursions by the number of days in which an individual was observed. 
+
+```{r exc-rate}
+exc.ok <- exc.oa[exc.oa$screen.result=="ok",]
+exc.ok <- left_join(exc.ok, pair.key, by = c("id"))
+
+
+## need to control for days observed, so do number of events per non-dispersal-days observed
+# number of days observed overall
+ndays.obs <- ddply(excursions.dat.nd, .(id, pair.id, class), function(x) length(unique(x$odays)))
+# number of days observed per month pre-case-death
+ndays.obs.mpd <- ddply(excursions.dat.nd, .(id, pair.id, class, mpd), function(x) length(unique(x$odays)))
+colnames(ndays.obs)[colnames(ndays.obs)=="V1"] <- colnames(ndays.obs.mpd)[colnames(ndays.obs.mpd)=="V1"] <- "ndays.obs"
+
+# number of excursion events overall
+nevents <- ddply(exc.ok, .(id, pair.id, class), function(x) length(unique(x$event)))
+# number of excursion events per month pre-case-death
+nevents.mpd <- ddply(exc.ok, .(id, pair.id, class, mpd), function(x) length(unique(x$event)))
+colnames(nevents)[colnames(nevents)=="V1"] <- colnames(nevents.mpd)[colnames(nevents.mpd)=="V1"] <- "nevents"
+
+## join days observed and excursion counts together
+exc.rate <- left_join(ndays.obs, nevents, by = c("id", "pair.id", "class"))
+# an "NA" for "nevents" means there were no excursion events detected
+exc.rate$nevents[is.na(exc.rate$nevents)] <- 0   
+exc.rate$exc.rate <- exc.rate$nevents/exc.rate$ndays.obs
+
+## repeat for monthly data
+exc.rate.mpd <- left_join(ndays.obs.mpd, nevents.mpd, by = c("id", "pair.id", "class", "mpd"))
+exc.rate.mpd$nevents[is.na(exc.rate.mpd$nevents)] <- 0
+exc.rate.mpd$exc.rate <- exc.rate.mpd$nevents/exc.rate.mpd$ndays.obs
+
+## view data
+head(exc.rate) # each line represents one deer
+
+## add deer sex to the excursion data
+exc.rate <- left_join(exc.rate, meta[,c("pair.id", "sex.x")], by = "pair.id")
+exc.rate.mpd <- left_join(exc.rate.mpd, meta[,c("pair.id", "sex.x")], by = "pair.id")
+
+## summarize number of excursion events overall
+summary(exc.rate$nevents) 
+
+## summarize excursion rates (events divided by days observed) overall
+summary(exc.rate$exc.rate)
+
+```
+  
+
+#### Fix rates during excursions
+
+Our fix rates are probably affecting our ability to detect excursions, as well as the distance and duration of those excursions. So let's determine the fix rate for each of our excursion events. The movement data has all been resampled previously, so fix rates should be fairly consistent within individuals (except for where a fix rate change resulted in a non-divisible fix rate; e.g., every 4 hours --> every 12 hours, but then every 13 hours has to stay at every 13).
+
+```{r fix-rates}
+
+fix.rates.ov <- ddply(excursions.dat.nd, .(id, pair.id, class), function(x) round(median(x$dt/3600, na.rm = T),1)) # overall
+fix.rates.mpd <- ddply(excursions.dat.nd, .(id, pair.id, class, mpd), function(x) round(median(x$dt/3600, na.rm = T),1)) # by month
+colnames(fix.rates.ov)[colnames(fix.rates.ov)=="V1"] <- colnames(fix.rates.mpd)[colnames(fix.rates.mpd)=="V1"] <- "fix.rate.hrs"
+
+## add fix rate info to ongoing datasets
+exc.rate <- left_join(exc.rate, fix.rates.ov, by = c("id", "pair.id", "class"))
+exc.rate.mpd <- left_join(exc.rate.mpd, fix.rates.mpd, by = c("id", "pair.id", "class", "mpd"))
+exc.ok <- left_join(exc.ok, fix.rates.mpd, by = c("id", "pair.id", "class", "mpd"))
+```
+
+
+#### Excursion duration
+
+I'm going to demonstrate testing for any differences in the duration of excursions. However, because GPS collar data isn't continuous (there are time gaps between fixes), we can't know precisely when an excursion started or when it ended.  
+
+Here's what we know:
+
+1. The start of the excursion should be sometime between the first anomalous observation and the observation immediately preceding that one.  
+2. The end of the excursion should be sometime between the last anomalous observation and the observation immediately following that one.
+
+From an interval censoring perspective, the left side of the interval for duration (i.e., the shortest possible duration) should be: (last anomalous - first anomalous)  
+
+
+and the right side of the interval (i.e., the longest possible duration) should be: (first post-excursion non-anomalous - last pre-excursion non-anomalous)  
+
+Let's make these calculations and add them to our dataset.
+
+```{r calc-duration}
+
+exc.ok$dur.right.hrs <- exc.ok$dur.left.hrs <- NA
+
+# loop through observed and screened excursions
+for(i in 1:nrow(exc.ok)){
+  
+  temp.exc <- exc.ok[i,]
+  
+  temp.dat <- excursions.dat.nd[excursions.dat.nd$id==temp.exc$id,]
+
+  
+  temp.dat.anoms <- which(temp.dat$evtid==temp.exc$evtid)
+
+
+  t1 <- temp.dat$date[min(temp.dat.anoms)-1]
+  t2 <- temp.dat$date[min(temp.dat.anoms)]
+  t3 <- temp.dat$date[max(temp.dat.anoms)]
+  t4 <- temp.dat$date[max(temp.dat.anoms)+1]
+  
+  exc.ok$dur.left.hrs[i] <- as.numeric(difftime(t3, t2, units = "hours"))
+  
+  if(min(temp.dat.anoms)==1){
+    t1 <- Inf ## if the first anomalous point is also the first point in the trajectory, "minimum start point" becomes infinity
+  }
+  
+  if(max(temp.dat.anoms)==nrow(temp.dat)){
+    t4 <- Inf ## if the last anomolous point is also the last point in the trajectory, "maximum end point" becomes infinity
+  }
+
+  exc.ok$dur.right.hrs[i] <- abs(as.numeric(difftime(t4, t1, units = "hours"))) # absolute value to deal with any "negative infinities"
+
+  
+}
+
+
+```
+
+
+
+### Do CWD cases travel for longer durations during excursions than controls?
+
+Now we can statistically evaluate our excursion durations.
+
+Unfortunately, we can't be entirely confident in the duration of our detected excursions because we are not continuously monitoring animals. When we calculated "durations" above, we really were establishing the minimum and maximum durations for each excursion. Here, we defined the minimum duration as the time between the first and last anomalous net-squared displacement (NSD) fixes (which are really anomalous "days" because we evaluated daily average NSD). The maximum duration is the time difference between the fixes on "either side" of those anomalous points - the last non-anomalous fix before the first anomalous one, and the first non-anomalous fix after the last anomalous one.  
+
+In order to analyze these data, we can use a survival analysis (where the "time to event" is "time to end of excursion") and use interval tools to accommodate the "interval" nature of our data.  
+
+Our main hypotheses are that excursion duration is affected by CWD class (case or control), and that this effect may vary by the number of months prior to death (e.g., we might expect a case's excursion to be shorter in the month prior to death, as compared to six months prior to death; in contrast, we might not expect control excursions to vary in duration based on months prior to case death). In addition, we'll include our fix rates in our modeling, as our duration estimates are likely affected by our fix rates.  
+
+We can use a Cox proportional hazards (PH) model with our interval data. However, we need to make sure that our model meets the assumptions of "proportional hazards." To do so, we'll follow recommendations from Kleinbaum and Klein (2005; "Survival Analysis: A Self-Learning Text), making observed (from Kaplan-Meier curves) versus expected (from PH models) plots for each of our candidate predictors. If a potential predictor violates the proportional hazards assumption, we'll expect to see poor alignment between the observed and expected curves. 
+
+```{r duration-model-checkPH}
+ph.dat <- exc.ok
+ph.dat$fix.rate.hrs_sc <- scale(ph.dat$fix.rate.hrs)[,1] # scale and center
+
+
+## months prior to case death PH check
+# expected
+drm0 <- ic_sp(cbind(dur.left.hrs, dur.right.hrs) ~ mpd, model = "ph", bs_samples = 100, data = ph.dat)
+
+# observed
+drm1 <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$mpd==1,])
+drm2 <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$mpd==2,])
+drm3 <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$mpd==3,])
+drm4 <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$mpd==4,])
+drm5 <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$mpd==5,])
+drm6 <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$mpd==6,])
+
+newdata.mpd1 <- data.frame(mpd = 1)
+newdata.mpd2 <- data.frame(mpd = 2)
+newdata.mpd3 <- data.frame(mpd = 3)
+newdata.mpd4 <- data.frame(mpd = 4)
+newdata.mpd5 <- data.frame(mpd = 5)
+newdata.mpd6 <- data.frame(mpd = 6)
+
+plot(drm1, lwd = 2, main = "mpd = 1")
+lines(drm0, newdata.mpd1, col = "red", lty = "dashed")
+
+plot(drm2, lwd = 2, main = "mpd = 2")
+lines(drm0, newdata.mpd2, col = "orange", lty = "dashed")
+
+plot(drm3, lwd = 2, main = "mpd = 3")
+lines(drm0, newdata.mpd3, col = "gold", lty = "dashed")
+
+plot(drm4, lwd = 2, main = "mpd = 4")
+lines(drm0, newdata.mpd4, col = "green", lty = "dashed")
+
+plot(drm5, lwd = 2, main = "mpd = 5")
+lines(drm0, newdata.mpd5, col = "blue", lty = "dashed")
+
+plot(drm6, lwd = 2, main = "mpd = 6")
+lines(drm0, newdata.mpd6, col = "purple", lty = "dashed")
+
+
+
+## fix rate PH check
+# stratify into categories
+ph.dat$fix.rate.hrs_cat <- ifelse(ph.dat$fix.rate.hrs_sc<0, "low", "high")
+
+# expected
+drf0 <- ic_sp(cbind(dur.left.hrs, dur.right.hrs) ~ fix.rate.hrs_cat, model = "ph", bs_samples = 100, data = ph.dat)
+
+# observed
+drfl <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$fix.rate.hrs_cat=="low",])
+drfh <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$fix.rate.hrs_cat=="high",])
+
+
+newdata.low <- data.frame(fix.rate.hrs_cat = "low")
+rownames(newdata.low) <- "low"
+
+newdata.high <- data.frame(fix.rate.hrs_cat = "high")
+rownames(newdata.high) <- "high"
+
+
+plot(drfl, main = "low fix rates")
+lines(drf0, newdata.low, col = "blue", lty = "dashed")
+
+plot(drfh, main = "high fix rates")
+lines(drf0, newdata.high, col = "red", lty = "dashed")
+
+
+
+## class PH check
+
+# expected
+drc0 <- ic_sp(cbind(dur.left.hrs, dur.right.hrs) ~ class, model = "ph", bs_samples = 100, data = ph.dat)
+
+# observed
+drccs <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$class=="case",])
+drccl <- icfit(Surv(time = dur.left.hrs, time2 = dur.right.hrs, type="interval2") ~ 1, conf.int = F, data = ph.dat[ph.dat$class=="control",])
+
+newdata.case <- data.frame(class = "case")
+rownames(newdata.case) <- "case"
+
+newdata.cntrl <- data.frame(class = "control")
+rownames(newdata.cntrl) <- "control"
+
+
+plot(drccl, main = "controls")
+lines(drc0, newdata.cntrl, col = "blue", lty = "dashed")
+
+plot(drccs, main = "cases")
+lines(drc0, newdata.case, col = "red", lty = "dashed")
+```
+
+Based on these plots, I have some concerns about the "months prior to death" variable violating the "proportional hazards" assumption. In addition, the fix rate variable looks borderline. I'll include it in a final semi-parametric Cox model below, but I'll exclude months prior to death. 
+
+```{r duration-model-fit}
+### fit final model
+dr1 <- ic_sp(cbind(dur.left.hrs, dur.right.hrs) ~ class + fix.rate.hrs_sc, model = "ph", bs_samples = 100, data = ph.dat)
+dr1
+
+mod.out <- data.frame(summary(dr1)$summaryParameters)
+mod.out$Variable <- rownames(mod.out)
+mod.out <- mod.out[,c("Variable", "Estimate", "Exp.Est.", "Std.Error", "p")]
+colnames(mod.out) <- c("Variable", "Estimate", "Exp Est", "Standard error", "p-value")
+# write.csv(mod.out, "../Output/Excursion_analysis/excursion_duration_semiparametric_results.csv", row.names = F)
+
+```
+
+From these results, we can see that there isn't a statistically significant difference in excursion duration between cases and controls. 
+
+We can also try to fit a parametric survival model, which would allow us to include "months prior to death" as a potentially time-varying covariate. Let's take a look at the different choices for parametric baseline models, and then fit some accelerated failure time (AFT) models that include our months prior to death (mpd) covariate.
+
+```{r duration-model-fit-parametric}
+
+diag_baseline(dr1, cols = NULL,lgdLocation = "topright")
+
+par_loglogistic <- ic_par(formula = cbind(dur.left.hrs, dur.right.hrs) ~ class * mpd + fix.rate.hrs_sc, data = ph.dat,
+                          model = "aft", dist = "loglogistic")
+
+par_lognorm <- ic_par(formula = cbind(dur.left.hrs, dur.right.hrs) ~ class * mpd + fix.rate.hrs_sc, data = ph.dat,
+                          model = "aft", dist = "lnorm")
+
+
+## Kaplan-Meier curve
+result.icfit <- icfit(Surv(time=dur.left.hrs, time2=dur.right.hrs, type="interval2") ~ 1, conf.int=F, data=ph.dat) 
+plot(result.icfit, YLAB="Predicted survival functions", XLAB="Time (hours)", estpar=list(col="black",lty=2))
+# add PH results
+lines(dr1,lty=1,lwd=2, col = "red")
+# add parametric model results
+par_AFT_loglogistic_surv <- survCIs(par_loglogistic, newdata = NULL, p = NULL, q = NULL, ci_level = 0,MC_samps = 4000)
+par_AFT_lognorm_surv <- survCIs(par_lognorm, newdata = NULL, p = NULL, q = NULL, ci_level = 0,MC_samps = 4000)
+lines(par_AFT_loglogistic_surv,lty=1,col="purple")
+lines(par_AFT_lognorm_surv,lty=1,col="blue")
+
+
+summary(par_loglogistic)
+summary(par_lognorm)
+
+mod.out <- data.frame(summary(par_loglogistic)$summaryParameters)
+mod.out$Variable <- rownames(mod.out)
+mod.out <- mod.out[,c("Variable", "Estimate", "Exp.Est.", "Std.Error", "p")]
+colnames(mod.out) <- c("Variable", "Estimate", "Exp Est", "Standard error", "p-value")
+# write.csv(mod.out, "../Output/Excursion_analysis/excursion_duration_loglogistic_parametric_results.csv", row.names = F)
+
+```
+
+From the two AFT models, we've confirmed our previous findings that we lack evidence for a difference in excursion duration between cases and controls. We also see that excursion durations were shorter with increasing months prior to case death (i.e., they were longer closer to case death), though this relationship did not achieve statistical significance, and there was not a difference in this relationship between cases and controls. I don't have a biological reason for controls to have changing excursion durations, relative to the timing of case death, so this might be a somewhat spurious observation, or be based on something (e.g., seasonality) affecting excursions across both cases and controls.  
+
+We can make a quick survival plot of just cases and controls at mean fix rates just to wrap things up.
+
+```{r duration-model-plot}
+newdata <- data.frame(class = c("control", "case"),
+                      fix.rate.hrs_sc = c(0,0))
+rownames(newdata) <- c("control", "case")
+
+# jpeg("../Figures/Excursion_analysis/excursion_duration_semiparametric_survivalcurve.jpeg", width = 6, height = 5, units = "in", res = 300)
+plot(dr1, newdata, xlab = "Time (hours)")
+# dev.off()
+
+```
+
+Plotting them thusly highlights the lack of significant difference between our two classes.  
+
+
+#### Session Info  
+
+I'll close with my session info, and thank you for reading this far!
+
+```{r session-info}
+sessionInfo()
+```
+
+
