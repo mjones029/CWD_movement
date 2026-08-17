@@ -1,7 +1,8 @@
 # CWD_movement
 This repository contains representative code for key analyses in the manuscript, "Malady in motion: Effects of chronic wasting disease on host movement."  
 
-This repository is versioned and archived with Zenodo.
+This repository is versioned and archived with Zenodo: [![DOI](https://zenodo.org/badge/1025132114.svg)](https://doi.org/10.5281/zenodo.21983271)
+
 
 All code includes RMarkdown scripts with HTML outputs so users can see analyses in context. Most data for this manuscript is not publicly available*, so the HTML files help document methods in light of this.  
 
