@@ -916,43 +916,7 @@ colnames(mod.out) <- c("Variable", "Estimate", "Exp Est", "Standard error", "p-v
 
 From these results, we can see that there isn't a statistically significant difference in excursion duration between cases and controls. 
 
-We can also try to fit a parametric survival model, which would allow us to include "months prior to death" as a potentially time-varying covariate. Let's take a look at the different choices for parametric baseline models, and then fit some accelerated failure time (AFT) models that include our months prior to death (mpd) covariate.
 
-```{r duration-model-fit-parametric}
-
-diag_baseline(dr1, cols = NULL,lgdLocation = "topright")
-
-par_loglogistic <- ic_par(formula = cbind(dur.left.hrs, dur.right.hrs) ~ class * mpd + fix.rate.hrs_sc, data = ph.dat,
-                          model = "aft", dist = "loglogistic")
-
-par_lognorm <- ic_par(formula = cbind(dur.left.hrs, dur.right.hrs) ~ class * mpd + fix.rate.hrs_sc, data = ph.dat,
-                          model = "aft", dist = "lnorm")
-
-
-## Kaplan-Meier curve
-result.icfit <- icfit(Surv(time=dur.left.hrs, time2=dur.right.hrs, type="interval2") ~ 1, conf.int=F, data=ph.dat) 
-plot(result.icfit, YLAB="Predicted survival functions", XLAB="Time (hours)", estpar=list(col="black",lty=2))
-# add PH results
-lines(dr1,lty=1,lwd=2, col = "red")
-# add parametric model results
-par_AFT_loglogistic_surv <- survCIs(par_loglogistic, newdata = NULL, p = NULL, q = NULL, ci_level = 0,MC_samps = 4000)
-par_AFT_lognorm_surv <- survCIs(par_lognorm, newdata = NULL, p = NULL, q = NULL, ci_level = 0,MC_samps = 4000)
-lines(par_AFT_loglogistic_surv,lty=1,col="purple")
-lines(par_AFT_lognorm_surv,lty=1,col="blue")
-
-
-summary(par_loglogistic)
-summary(par_lognorm)
-
-mod.out <- data.frame(summary(par_loglogistic)$summaryParameters)
-mod.out$Variable <- rownames(mod.out)
-mod.out <- mod.out[,c("Variable", "Estimate", "Exp.Est.", "Std.Error", "p")]
-colnames(mod.out) <- c("Variable", "Estimate", "Exp Est", "Standard error", "p-value")
-# write.csv(mod.out, "../Output/Excursion_analysis/excursion_duration_loglogistic_parametric_results.csv", row.names = F)
-
-```
-
-From the two AFT models, we've confirmed our previous findings that we lack evidence for a difference in excursion duration between cases and controls. We also see that excursion durations were shorter with increasing months prior to case death (i.e., they were longer closer to case death), though this relationship did not achieve statistical significance, and there was not a difference in this relationship between cases and controls. I don't have a biological reason for controls to have changing excursion durations, relative to the timing of case death, so this might be a somewhat spurious observation, or be based on something (e.g., seasonality) affecting excursions across both cases and controls.  
 
 We can make a quick survival plot of just cases and controls at mean fix rates just to wrap things up.
 
