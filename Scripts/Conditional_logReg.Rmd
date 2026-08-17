@@ -50,7 +50,7 @@ library(GGally)
 Next we'll load some custom functions that come in handy later on.
 
 ```{r load-functions}
-#### load cust functions ####
+#### load custom functions ####
 
 ## function for determining which days match within a case-control pair
 matching.days <- function(temp){
@@ -232,7 +232,7 @@ aics <- AIC(
 aics[order(aics$AIC),]
 ```
 
-Based on these results, we'll keep movement rate, not daily distance. In addition, we'll exclude variance, because that metric was also correlated with movement rate. Lastely, we'll use log-transformed displacement instead of non-transformed. Now we can move forward and fit our full models.  
+Based on these results, we'll keep movement rate, not daily distance. In addition, we'll exclude variance, because that metric was also correlated with movement rate. Lastly, we'll use log-transformed displacement instead of non-transformed. Now we can move forward and fit our full models.  
 
 
 ## Full models
