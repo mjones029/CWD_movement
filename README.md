@@ -1,7 +1,7 @@
 # CWD_movement
-This repository contains representative code for key analyses in the manuscript, "Malady in motion: Chronic wasting disease effects on host movement."  
+This repository contains representative code for key analyses in the manuscript, "Malady in motion: Effects of chronic wasting disease on host movement."  
 
-This repository will be versioned and archived with Zenodo, upon manuscript acceptance.
+This repository is versioned and archived with Zenodo.
 
 All code includes RMarkdown scripts with HTML outputs so users can see analyses in context. Most data for this manuscript is not publicly available*, so the HTML files help document methods in light of this.  
 
@@ -27,4 +27,4 @@ Once downloaded, just click on the downloaded file and the HTML should appear in
 
 *At the time of publication, movement data were not available from the Wisconsin Department of Natural Resources; restrictions apply to the availability of these data, which were used under a data sharing agreement for the current study, and so are not publicly available. Data may be requested from the Wisconsin Department of Natural Resources through Daniel Storm (DanielJ.Storm@wisconsin.gov).  
 
-White-tailed deer genotype data for prion protein gene *PRNP* codon 96 will be available through ScienceBase upon manuscript acceptance.
+White-tailed deer genotype data for prion protein gene *PRNP* codon 96 are available through ScienceBase ([Herbst et al. 2025](https://doi.org/10.5066/P137CERE)).
